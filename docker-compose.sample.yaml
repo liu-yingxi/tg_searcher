@@ -11,7 +11,7 @@ version: '3'
 services:
   tg_searcher:
     image: non10086/tg_searcher
-    container_name: tg_searcher
+    container_name: tg_searcher2
     restart: unless-stopped
     volumes:
       - ./config:/app/config
@@ -25,7 +25,7 @@ services:
 
   redis:
     image: redis:alpine
-    container_name: tg_searcher_redis
+    container_name: tg_searcher_redis2
     restart: unless-stopped
     command: >-
       redis-server --appendonly yes --appendfilename "redis_db.aof" --appendfsync everysec 
