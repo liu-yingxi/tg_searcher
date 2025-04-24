@@ -12,6 +12,17 @@ from whoosh.query import Term, Or
 import whoosh.highlight as highlight
 from jieba.analyse.analyzer import ChineseAnalyzer
 
+# 尝试获取日志记录器，如果 common.py 不可用或 get_logger 未定义，则使用标准 logging
+try:
+    from .common import get_logger
+    logger = get_logger('indexer')
+except (ImportError, AttributeError):
+    import logging
+    logger = logging.getLogger('indexer')
+    # 配置基本的日志记录，以便在无法从 common 获取时仍能看到信息
+    if not logger.hasHandlers():
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
 
 class IndexMsg:
     # --- Schema 已包含 filename ---
@@ -30,7 +41,11 @@ class IndexMsg:
                  post_time: datetime, sender: str, filename: Optional[str] = None): # 添加 filename 参数
         self.content = content # 消息文本/标题
         self.url = url
-        self.chat_id = int(chat_id)
+        try:
+            self.chat_id = int(chat_id)
+        except (ValueError, TypeError):
+             logger.warning(f"Invalid chat_id '{chat_id}' passed to IndexMsg, using 0.")
+             self.chat_id = 0
         self.post_time = post_time
         self.sender = sender
         self.filename = filename # 文件名
@@ -38,19 +53,21 @@ class IndexMsg:
 
     # --- as_dict 已包含 filename ---
     def as_dict(self):
+        # 返回适合 Whoosh 存储的字典，确保 chat_id 是字符串
         return {
-            'content': self.content,
-            'url': self.url,
+            'content': self.content or "", # 确保非 None
+            'url': self.url or "", # 确保非 None
             'chat_id': str(self.chat_id),
             'post_time': self.post_time,
-            'sender': self.sender,
-            'filename': self.filename # 添加 filename
+            'sender': self.sender or "", # 确保非 None
+            'filename': self.filename # filename 可以是 None
         }
     # --- 结束修改 ---
 
     def __str__(self):
         # 稍微调整 __str__ 以包含 filename (可选)
         fields = self.as_dict()
+        # filename 可能为 None， repr(None) 是 'None'，没问题
         return f'IndexMsg(' + ', '.join(f'{k}={repr(v)}' for k, v in fields.items()) + ')'
 
 
@@ -81,20 +98,29 @@ class Indexer:
 
         def _clear():
             import shutil
+            logger.warning(f"Clearing index directory: {index_dir}")
             shutil.rmtree(index_dir)
             index_dir.mkdir()
             self.ix = index.create_in(index_dir, IndexMsg.schema, index_name)
+            logger.info(f"Index directory cleared and new index created.")
 
         if from_scratch:
             _clear()
 
         # 打开或创建索引
         try:
-            self.ix = index.open_dir(index_dir, index_name) \
-                if index.exists_in(index_dir, index_name) \
-                else index.create_in(index_dir, IndexMsg.schema, index_name)
+            if index.exists_in(index_dir, index_name):
+                logger.info(f"Opening existing index in {index_dir}")
+                self.ix = index.open_dir(index_dir, index_name)
+            else:
+                logger.info(f"Creating new index in {index_dir}")
+                self.ix = index.create_in(index_dir, IndexMsg.schema, index_name)
         except index.EmptyIndexError: # 处理可能的空索引错误
+             logger.warning(f"Index in {index_dir} was empty or corrupted, creating new index.")
              self.ix = index.create_in(index_dir, IndexMsg.schema, index_name)
+        except Exception as e:
+             logger.critical(f"Failed to open or create index in {index_dir}: {e}", exc_info=True)
+             raise # 重新抛出严重错误
 
 
         # 检查 Schema 是否兼容
@@ -121,7 +147,11 @@ class Indexer:
         # --- 结束修改 ---
 
         # 高亮仍然基于 content 字段
-        self.highlighter = highlight.Highlighter(fragmenter=highlight.ContextFragmenter(maxchars=200, surround=50))
+        # 使用 ContextFragmenter 并增加 maxchars 和 surround
+        self.highlighter = highlight.Highlighter(
+            fragmenter=highlight.ContextFragmenter(maxchars=300, surround=100), # 增加高亮范围
+            formatter=highlight.HtmlFormatter(tagname="u") # 使用下划线高亮
+        )
 
     def retrieve_random_document(self) -> IndexMsg:
         with self.ix.searcher() as searcher:
@@ -139,21 +169,33 @@ class Indexer:
             random_doc_num = random.choice(doc_nums)
             # 获取随机文档的字段
             msg_dict = searcher.stored_fields(random_doc_num)
+            if not msg_dict: # 如果获取不到字段
+                 raise IndexError(f"Could not retrieve stored fields for random doc number {random_doc_num}")
+
             # 修复可能因为 schema 变更导致的缺少字段问题（给默认值）
+            # filename 可以是 None
             msg_dict.setdefault('filename', None)
-            # 确保所有必要的字段都存在，否则提供默认值或抛出错误
-            # （根据 IndexMsg.__init__ 的需要来补充）
+            # 确保 IndexMsg 需要的其他字段存在
             msg_dict.setdefault('content', '')
-            msg_dict.setdefault('url', '') # URL 通常不应该为空
-            msg_dict.setdefault('chat_id', 0) # 需要一个有效的 chat_id
-            msg_dict.setdefault('post_time', datetime.now()) # 可能需要一个默认时间
+            msg_dict.setdefault('url', '') # URL 不应该为空，但以防万一
+            msg_dict.setdefault('chat_id', 0) # 提供默认值
+            msg_dict.setdefault('post_time', datetime.now()) # 提供默认值
             msg_dict.setdefault('sender', '')
 
             try:
-                return IndexMsg(**msg_dict)
-            except TypeError as e:
-                 # 如果仍然缺少字段，记录错误并抛出
-                 raise ValueError(f"Failed to reconstruct IndexMsg from stored fields {msg_dict}: {e}")
+                # 使用构造函数处理类型转换
+                return IndexMsg(
+                    content=msg_dict['content'],
+                    url=msg_dict['url'],
+                    chat_id=msg_dict['chat_id'],
+                    post_time=msg_dict['post_time'],
+                    sender=msg_dict['sender'],
+                    filename=msg_dict['filename']
+                )
+            except Exception as e:
+                 # 如果仍然缺少字段或类型错误
+                 logger.error(f"Failed to reconstruct IndexMsg from stored fields {msg_dict}: {e}", exc_info=True)
+                 raise ValueError(f"Failed to reconstruct IndexMsg from stored fields: {e}")
 
     def add_document(self, message: IndexMsg, writer: Optional[IndexWriter] = None):
         commit_locally = False
@@ -162,100 +204,119 @@ class Indexer:
             commit_locally = True
 
         try:
-            # 确保传递给 add_document 的是字典
+            # 获取适合 Whoosh 的字典，确保字段值非 None (除了 filename)
             doc_data = message.as_dict()
-            # 处理 None 值，Whoosh 不接受 None
-            for key, value in doc_data.items():
-                if value is None:
-                    # 根据字段类型设置合适的默认值，例如空字符串
-                    if isinstance(IndexMsg.schema[key], (TEXT, ID)):
-                         doc_data[key] = ""
-                    # 可以为其他类型添加处理，但这里主要是 filename 和 content
+            # filename 可以是 None，Whoosh TEXT 字段能处理
+            # 其他字段在 as_dict 中已确保非 None
+
+            # 检查 URL 是否为空，如果为空则跳过或记录错误
+            if not doc_data.get('url'):
+                 logger.warning(f"Skipping document with empty URL. Content: {doc_data.get('content', '')[:50]}")
+                 if commit_locally: writer.cancel() # 如果是独立写入，取消
+                 return # 不添加没有 URL 的文档
+
             writer.add_document(**doc_data)
             if commit_locally:
                 writer.commit()
         except Exception as e:
             if commit_locally:
                 writer.cancel() # 出错时取消写入
+            logger.error(f"Error adding document (URL: {message.url}): {e}", exc_info=True)
             raise e # 重新抛出异常
 
+    # --- search 方法已修复 AttributeError ---
     def search(self, q_str: str, in_chats: Optional[List[int]], page_len: int, page_num: int = 1) -> SearchResult:
         # 解析查询字符串
         try:
             q = self.query_parser.parse(q_str)
+            logger.debug(f"Parsed query: {q}")
         except Exception as e:
-             # 处理查询解析错误，例如语法错误
-             # 可以返回一个空结果或者特定的错误信息
-             # raise ValueError(f"Invalid search query: {e}") # 抛出异常让上层处理
-             return SearchResult([], True, 0) # 或者返回空结果
+             logger.error(f"Failed to parse query '{q_str}': {e}")
+             return SearchResult([], True, 0) # 返回空结果
 
         with self.ix.searcher() as searcher:
             q_filter = None
             if in_chats:
-                 # 确保 chat_id 列表非空
-                 valid_chat_ids = [str(chat_id) for chat_id in in_chats if chat_id]
+                 # 确保 chat_id 列表非空且元素有效
+                 valid_chat_ids = [str(chat_id) for chat_id in in_chats if isinstance(chat_id, int) or (isinstance(chat_id, str) and chat_id.isdigit())]
                  if valid_chat_ids:
                       q_filter = Or([Term('chat_id', chat_id_str) for chat_id_str in valid_chat_ids])
+                      logger.debug(f"Applying chat filter: {q_filter}")
 
             try:
+                # 使用 allow_fragments=True 可以在结果少于页长时仍获取片段
                 result_page = searcher.search_page(q, page_num, page_len, filter=q_filter,
-                                                   sortedby='post_time', reverse=True, mask=q_filter) # 使用 mask 优化过滤
+                                                   sortedby='post_time', reverse=True, mask=q_filter,
+                                                   terms=True) # terms=True 用于高亮
+                logger.debug(f"Search executed. Page {page_num} has {len(result_page)} results. Total found: {result_page.total}")
             except Exception as e:
-                # 处理搜索执行错误
-                # raise RuntimeError(f"Search execution failed: {e}")
+                logger.error(f"Search execution failed for query '{q}' and filter '{q_filter}': {e}", exc_info=True)
                 return SearchResult([], True, 0) # 返回空结果
 
-                hits = []
-    for hit in result_page: # 将变量名改为 hit，更清晰表明它是 Hit 对象
-        # 从 Hit 对象获取存储的字段，如果字段不存在会返回 None
-        stored_fields = hit.fields() # 获取包含所有存储字段的字典
+            hits = []
+            for hit in result_page: # hit 是 Hit 对象
+                try:
+                    # 从 Hit 对象获取存储的字段字典
+                    stored_fields = hit.fields()
+                    if not stored_fields: # 如果没有存储字段，跳过
+                         logger.warning(f"Hit {hit.docnum} has no stored fields, skipping.")
+                         continue
 
-        # 为 IndexMsg 准备参数，处理可能的 None 值
-        msg_content = stored_fields.get('content', '')
-        msg_url = stored_fields.get('url', '')
-        msg_chat_id = stored_fields.get('chat_id', 0) # 提供默认值
-        try:
-            # 确保 chat_id 是整数
-            msg_chat_id = int(msg_chat_id)
-        except (ValueError, TypeError):
-            msg_chat_id = 0 # 无效则设为 0
-        msg_post_time = stored_fields.get('post_time', datetime.now()) # 提供默认值
-        msg_sender = stored_fields.get('sender', '')
-        msg_filename = stored_fields.get('filename', None) # filename 可以是 None
+                    # 为 IndexMsg 准备参数，处理可能的 None 值和类型
+                    msg_content = stored_fields.get('content', '')
+                    msg_url = stored_fields.get('url', '')
+                    msg_chat_id_str = stored_fields.get('chat_id', '0')
+                    try: msg_chat_id = int(msg_chat_id_str)
+                    except (ValueError, TypeError): msg_chat_id = 0
+                    msg_post_time = stored_fields.get('post_time', datetime.now())
+                    msg_sender = stored_fields.get('sender', '')
+                    msg_filename = stored_fields.get('filename', None) # filename 可以是 None
 
-        try:
-            # 使用获取到的值创建 IndexMsg
-            msg = IndexMsg(
-                content=msg_content,
-                url=msg_url,
-                chat_id=msg_chat_id,
-                post_time=msg_post_time,
-                sender=msg_sender,
-                filename=msg_filename
-            )
-            # 使用 Hit 对象进行高亮
-            highlighted_content = self.highlighter.highlight_hit(hit, 'content', top=3) # 使用原始 hit 对象高亮
-            hits.append(SearchHit(msg, highlighted_content))
-        except Exception as e:
-            self._logger.error(f"Failed to create IndexMsg/SearchHit from hit fields {stored_fields}: {e}")
-            pass # 或者记录日志
+                    # 创建 IndexMsg
+                    msg = IndexMsg(
+                        content=msg_content,
+                        url=msg_url,
+                        chat_id=msg_chat_id,
+                        post_time=msg_post_time,
+                        sender=msg_sender,
+                        filename=msg_filename
+                    )
 
-            return SearchResult(hits, result_page.is_last_page(), result_page.total)
+                    # 使用 Hit 对象进行高亮
+                    highlighted_content = self.highlighter.highlight_hit(hit, 'content', top=1) # 只取第一个高亮片段
+                    if not highlighted_content and msg_content: # 如果没有高亮但有内容，显示部分内容
+                         highlighted_content = msg_content[:150] + ('...' if len(msg_content) > 150 else '')
+
+                    hits.append(SearchHit(msg, highlighted_content or "")) # 确保高亮不是 None
+
+                except Exception as e:
+                    logger.error(f"Failed to process hit {hit.docnum} with fields {stored_fields}: {e}", exc_info=True)
+                    # 跳过这条有问题的结果
+                    pass
+
+            # is_last_page() 可能不完全准确，用数量判断更可靠
+            is_last = (page_num * page_len) >= result_page.total
+            return SearchResult(hits, is_last, result_page.total)
+    # --- 结束修复 search ---
+
 
     def list_indexed_chats(self) -> Set[int]:
         if self.ix.is_empty():
              return set()
-        # 使用 Reader 上下文管理器确保关闭
         with self.ix.reader() as r:
-            # 使用 set comprehension 避免重复
             try:
-                # 使用 terms=True 获取字段的所有唯一词项
+                # 使用 lexicon 获取所有唯一的 chat_id 词项 (bytes)
                 return {int(chat_id_bytes.decode('utf-8')) for chat_id_bytes in r.lexicon('chat_id')}
-            except KeyError: # 如果 'chat_id' 字段不存在或为空
+            except KeyError:
+                logger.warning("'chat_id' field not found in index lexicon.")
                 return set()
-            except Exception as e: # 捕获其他潜在错误
-                 # logger.error(f"Error listing indexed chats: {e}")
+            except ValueError as e:
+                 logger.error(f"Error converting chat_id from lexicon to int: {e}")
+                 return set() # 返回空，避免因一个错误 ID 导致整体失败
+            except Exception as e:
+                 logger.error(f"Error listing indexed chats from lexicon: {e}", exc_info=True)
                  return set()
+
 
     # --- count_by_query 方法已添加 ---
     def count_by_query(self, **kw):
@@ -263,63 +324,80 @@ class Indexer:
         if self.ix.is_empty():
             return 0
         if not kw:
-            return self.ix.doc_count() # 如果没有指定查询，返回总数
+            return self.ix.doc_count()
 
         # 构建查询条件 (目前只支持一个条件)
-        field, value = list(kw.items())[0]
-        query = Term(field, str(value)) # 确保值为字符串
+        try:
+             field, value = list(kw.items())[0]
+             query = Term(field, str(value)) # 确保值为字符串
+        except IndexError: # 如果 kw 为空或格式错误
+             logger.warning("count_by_query called with invalid arguments.")
+             return self.ix.doc_count() # 返回总数
 
         try:
              with self.ix.searcher() as s:
-                 # 使用 doc_count(query=...)
                  return s.doc_count(query=query)
         except Exception as e:
-             # logger.error(f"Error counting documents for query {kw}: {e}")
-             return 0 # 出错时返回 0
+             logger.error(f"Error counting documents for query {kw}: {e}", exc_info=True)
+             return 0
     # --- 结束添加 ---
 
     def delete(self, url: str):
-        # 使用 Term 对象删除更精确
+        if not url: # 避免删除空 URL
+             logger.warning("Attempted to delete document with empty URL.")
+             return
         with self.ix.writer() as writer:
-            writer.delete_by_term('url', url)
+            try:
+                writer.delete_by_term('url', url)
+            except Exception as e:
+                 logger.error(f"Error deleting document by url '{url}': {e}", exc_info=True)
+                 # 不取消，可能其他删除操作需要继续
 
     def get_document_fields(self, url: str) -> Optional[dict]:
         """获取指定 URL 的文档的所有存储字段"""
-        if self.ix.is_empty():
+        if self.ix.is_empty() or not url:
             return None
         with self.ix.searcher() as searcher:
             try:
-                 # 使用 document() 方法通过 unique 字段获取
                  doc = searcher.document(url=url)
-                 return doc # 返回 dict 或 None
-            except KeyError: # 如果 URL 不存在
+                 return doc
+            except KeyError:
+                 logger.debug(f"Document with url '{url}' not found.")
                  return None
             except Exception as e:
-                 # logger.error(f"Error getting document fields for url {url}: {e}")
+                 logger.error(f"Error getting document fields for url '{url}': {e}", exc_info=True)
                  return None
 
 
     # --- replace_document 方法已添加 ---
     def replace_document(self, url: str, new_fields: dict):
         """用新的字段完全替换指定 URL 的文档"""
+        if not url:
+             raise ValueError("Cannot replace document with empty URL.")
         # 确保必要的字段存在
         required_keys = ['content', 'url', 'chat_id', 'post_time', 'sender'] # filename 是可选的
         for key in required_keys:
             if key not in new_fields:
-                # 可以抛出错误，或者设置默认值
                  raise ValueError(f"Missing required field '{key}' when replacing document for url '{url}'")
 
-        # 处理 None 值
-        doc_data = new_fields.copy()
-        for key, value in doc_data.items():
-             if value is None:
-                  if isinstance(IndexMsg.schema[key], (TEXT, ID)):
-                       doc_data[key] = ""
-                  # 可以为其他类型添加处理
+        # 准备 Whoosh 接受的字典
+        doc_data = {
+            'content': new_fields.get('content', ''),
+            'url': url, # 确保 URL 正确
+            'chat_id': str(new_fields.get('chat_id', 0)), # 确保是字符串
+            'post_time': new_fields.get('post_time', datetime.now()),
+            'sender': new_fields.get('sender', ''),
+            'filename': new_fields.get('filename', None) # filename 可以是 None
+        }
 
         with self.ix.writer() as writer:
-            # update_document 会先删除匹配 unique 字段 (url) 的文档，然后添加新文档
-            writer.update_document(**doc_data)
+            try:
+                # update_document 会先删除匹配 unique 字段 (url) 的文档，然后添加新文档
+                writer.update_document(**doc_data)
+            except Exception as e:
+                 logger.error(f"Error replacing document with url '{url}': {e}", exc_info=True)
+                 writer.cancel() # 替换失败时取消
+                 raise e # 重新抛出
     # --- 结束添加 ---
 
     def clear(self):
@@ -334,12 +412,10 @@ class Indexer:
               try:
                    with self.ix.searcher() as searcher:
                         q = Term("chat_id", str(chat_id))
-                        # 使用 limit=0 只获取数量，可能比 limit=1 更快
-                        results = searcher.search(q, limit=0)
-                        # 使用 results.estimated_length() 获取匹配数量
+                        results = searcher.search(q, limit=0) # limit=0 只获取数量
                         return results.estimated_length() == 0
               except Exception as e:
-                   # logger.error(f"Error checking if chat {chat_id} is empty: {e}")
+                   logger.error(f"Error checking if chat {chat_id} is empty: {e}", exc_info=True)
                    return True # 出错时假设为空
          else:
               # 如果索引非空，则整体不为空
