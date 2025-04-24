@@ -6,30 +6,34 @@
 # `redis` 必须设置为 `redis:6379` 。
 # `runtime_dir` 必须设置为 `/app/config/tg_searcher_data` 。
 
+# 文件: /home/tg_searcher_fork/docker-compose.yaml
+
 version: '3'
 
 services:
-  tg_searcher:
-    image: non10086/tg_searcher
-    container_name: tg_searcher2
-    restart: unless-stopped2
+  tg_searcher: # 服务名可以不变，但容器名和镜像变了
+    image: non10086/tg_searcher:latest # 指向你的镜像
+    container_name: tg_searcher2       # 新的容器名
+    restart: unless-stopped            # 修正 restart
     volumes:
-      - ./config:/app/config
+      - ./config:/app/config         # 映射新目录下的 config
     depends_on:
       - redis
-    stdin_open: true  # once you've logged in, can be commented out 登入后可以注释掉
-    tty: true         # ditto 同上
+    # stdin_open 和 tty 可以根据需要保留或注释掉
+    stdin_open: true
+    tty: true
     command:
       - -f
       - /app/config/searcher.yaml
 
-  redis:
+  redis: # 服务名也可以不变，但容器名变了
     image: redis:alpine
-    container_name: tg_searcher_redis2
+    container_name: tg_searcher_redis2 # 新的 Redis 容器名
     restart: unless-stopped
     command: >-
-      redis-server --appendonly yes --appendfilename "redis_db.aof" --appendfsync everysec 
-      --no-appendfsync-on-rewrite no --auto-aof-rewrite-percentage 100 --auto-aof-rewrite-min-size 64mb 
+      redis-server --appendonly yes --appendfilename "redis_db.aof" --appendfsync everysec
+      --no-appendfsync-on-rewrite no --auto-aof-rewrite-percentage 100 --auto-aof-rewrite-min-size 64mb
       --aof-load-truncated yes
     volumes:
-      - ./config/redis_data:/data
+      # 使用新的、独立的 Redis 数据目录!
+      - ./config/redis_data2:/data   # <--- 修改这里，指向新的子目录
