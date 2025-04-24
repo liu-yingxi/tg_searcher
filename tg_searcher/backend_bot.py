@@ -8,6 +8,11 @@ from telethon import events
 from telethon.tl.patched import Message as TgMessage
 from telethon.tl.types import User
 from whoosh.query import Term # 导入 Term
+# --- ADDED IMPORTS ---
+from whoosh import writing
+from whoosh.writing import IndexWriter, LockError
+# --- END ADDED IMPORTS ---
+
 
 from .indexer import Indexer, IndexMsg, SearchResult # 导入 SearchResult
 from .common import CommonBotConfig, escape_content, get_share_id, get_logger, format_entity_name, brief_content, \
@@ -252,7 +257,7 @@ class BackendBot:
                  if current_chat_id not in self.newest_msg or newest_msg_in_batch.post_time > self.newest_msg[current_chat_id].post_time:
                       self.newest_msg[current_chat_id] = newest_msg_in_batch
                       self._logger.debug(f"Updated newest msg cache for {current_chat_id} to {newest_msg_in_batch.url}")
-        except writing.LockError:
+        except writing.LockError: # Use imported 'writing'
              logger.error("Index is locked, cannot write batch. Downloaded messages are lost.")
              if writer: writer.cancel() # 尝试取消
              # 可以选择抛出异常让前端知道
