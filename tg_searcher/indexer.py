@@ -205,26 +205,40 @@ class Indexer:
                 # raise RuntimeError(f"Search execution failed: {e}")
                 return SearchResult([], True, 0) # 返回空结果
 
-            hits = []
-            for hit_doc_fields in result_page: # hit_doc 是字段字典
-                # 修复字段缺失问题
-                hit_doc_fields.setdefault('filename', None)
-                # 确保其他必要字段存在，为 IndexMsg 提供默认值
-                hit_doc_fields.setdefault('content', '')
-                hit_doc_fields.setdefault('url', hit_doc_fields.get('url', '')) # URL 应该总是存在
-                hit_doc_fields.setdefault('chat_id', 0)
-                hit_doc_fields.setdefault('post_time', datetime.now())
-                hit_doc_fields.setdefault('sender', '')
+                hits = []
+    for hit in result_page: # 将变量名改为 hit，更清晰表明它是 Hit 对象
+        # 从 Hit 对象获取存储的字段，如果字段不存在会返回 None
+        stored_fields = hit.fields() # 获取包含所有存储字段的字典
 
-                try:
-                    msg = IndexMsg(**hit_doc_fields)
-                    # 高亮 content 字段
-                    highlighted_content = self.highlighter.highlight_hit(hit_doc_fields, 'content', top=3)
-                    hits.append(SearchHit(msg, highlighted_content))
-                except Exception as e:
-                    # 如果从存储字段创建 IndexMsg 失败，记录日志并跳过此条目
-                    # logger.error(f"Failed to create IndexMsg from hit {hit_doc_fields}: {e}")
-                    pass # 或者记录日志
+        # 为 IndexMsg 准备参数，处理可能的 None 值
+        msg_content = stored_fields.get('content', '')
+        msg_url = stored_fields.get('url', '')
+        msg_chat_id = stored_fields.get('chat_id', 0) # 提供默认值
+        try:
+            # 确保 chat_id 是整数
+            msg_chat_id = int(msg_chat_id)
+        except (ValueError, TypeError):
+            msg_chat_id = 0 # 无效则设为 0
+        msg_post_time = stored_fields.get('post_time', datetime.now()) # 提供默认值
+        msg_sender = stored_fields.get('sender', '')
+        msg_filename = stored_fields.get('filename', None) # filename 可以是 None
+
+        try:
+            # 使用获取到的值创建 IndexMsg
+            msg = IndexMsg(
+                content=msg_content,
+                url=msg_url,
+                chat_id=msg_chat_id,
+                post_time=msg_post_time,
+                sender=msg_sender,
+                filename=msg_filename
+            )
+            # 使用 Hit 对象进行高亮
+            highlighted_content = self.highlighter.highlight_hit(hit, 'content', top=3) # 使用原始 hit 对象高亮
+            hits.append(SearchHit(msg, highlighted_content))
+        except Exception as e:
+            self._logger.error(f"Failed to create IndexMsg/SearchHit from hit fields {stored_fields}: {e}")
+            pass # 或者记录日志
 
             return SearchResult(hits, result_page.is_last_page(), result_page.total)
 
