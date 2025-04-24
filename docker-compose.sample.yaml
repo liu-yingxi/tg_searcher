@@ -12,7 +12,7 @@ services:
   tg_searcher:
     image: non10086/tg_searcher
     container_name: tg_searcher2
-    restart: unless-stopped
+    restart: unless-stopped2
     volumes:
       - ./config:/app/config
     depends_on:
