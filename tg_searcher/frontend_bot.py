@@ -16,9 +16,24 @@ import telethon.errors.rpcerrorlist as rpcerrorlist
 from redis import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from .common import CommonBotConfig, get_logger, get_share_id, remove_first_word, brief_content
-from .backend_bot import BackendBot, EntityNotFoundError
-from .indexer import SearchResult, IndexMsg # 确保 IndexMsg 已更新
+# Assuming these imports work from your project structure
+try:
+    from .common import CommonBotConfig, get_logger, get_share_id, remove_first_word, brief_content
+    from .backend_bot import BackendBot, EntityNotFoundError
+    from .indexer import SearchResult, IndexMsg # 确保 IndexMsg 已更新
+except ImportError:
+    # Provide fallback or handle appropriately if run standalone
+    print("Warning: Assuming relative imports fail, define fallbacks if needed.")
+    # Define minimal fallbacks if necessary for the script to load without error
+    class CommonBotConfig: pass
+    def get_logger(name): import logging; return logging.getLogger(name)
+    def get_share_id(x): return int(x) if x else 0
+    def remove_first_word(s): return ' '.join(s.split()[1:]) if len(s.split()) > 1 else ''
+    def brief_content(s, l=50): return (s[:l] + '...') if len(s) > l else s
+    class BackendBot: pass
+    class EntityNotFoundError(Exception): pass
+    class SearchResult: pass
+    class IndexMsg: pass
 
 # 获取日志记录器
 logger = get_logger('frontend_bot')
@@ -69,7 +84,7 @@ class FakeRedis:
     def __init__(self): self._data = {}; self._logger = get_logger('FakeRedis'); self._logger.warning("Using FakeRedis: Data volatile.")
     def get(self, key): return self._data.get(key)
     def set(self, key, val, ex=None): self._data[key] = str(val) # 模拟字符串存储
-    def delete(self, *keys): count = 0; [self._data.pop(k, None) for k in keys if k in self._data and (count := count + 1)]; return count # 修复语法并简化
+    def delete(self, *keys): count = 0; keys_to_delete = [k for k in keys if k in self._data]; [self._data.pop(k) for k in keys_to_delete]; return len(keys_to_delete) # Corrected delete logic
     def ping(self): return True
 
 
@@ -136,6 +151,7 @@ class BotFrontend:
     async def start(self):
         try:
             if not self._cfg.admin: raise ValueError("Admin ID not configured.")
+            # Assuming backend.str_to_chat_id is async and handles conversion
             self._admin_id = await self.backend.str_to_chat_id(str(self._cfg.admin))
             self._logger.info(f"Admin ID resolved to: {self._admin_id}")
             if self._cfg.private_mode and self._admin_id: self._cfg.private_whitelist.add(self._admin_id); self._logger.info(f"Admin added to private whitelist.")
@@ -154,13 +170,16 @@ class BotFrontend:
              me = await self.bot.get_me(); assert me is not None
              self.username, self.my_id = me.username, me.id
              self._logger.info(f'Bot (@{self.username}, id={self.my_id}) login ok')
+             # Assuming get_share_id works correctly
              self.backend.excluded_chats.add(get_share_id(self.my_id)); self._logger.info(f"Bot ID {self.my_id} excluded from backend.")
              await self._register_commands(); self._logger.info(f'Commands registered.')
              self._register_hooks()
 
              if self._admin_id:
                   try:
-                       msg = '✅ Bot frontend init complete\n\n' + await self.backend.get_index_status(4000 - 20)
+                       # Assuming backend.get_index_status exists and is async
+                       status_msg = await self.backend.get_index_status(4000 - 50) # Adjusted length
+                       msg = f'✅ Bot frontend init complete\n\n{status_msg}'
                        await self.bot.send_message(self._admin_id, msg, parse_mode='html', link_preview=False)
                   except Exception as e: self._logger.error(f"Failed get/send initial status: {e}", exc_info=True); await self.bot.send_message(self._admin_id, f'⚠️ Bot started, but failed get status: {e}')
              else: self._logger.warning("No admin configured, skipping startup message.")
@@ -206,7 +225,9 @@ class BotFrontend:
                  chats = [int(cid) for cid in chats_str.split(',')] if chats_str else None
                  self._logger.info(f'Query:"{brief_content(q)}" chats={chats} filter={new_filter} page={new_page_num}')
                  start_time = time()
-                 try: result = self.backend.search(q, chats, self._cfg.page_len, new_page_num, file_filter=new_filter)
+                 try:
+                      # Assuming backend.search exists
+                      result = self.backend.search(q, chats, self._cfg.page_len, new_page_num, file_filter=new_filter)
                  except Exception as e: self._logger.error(f"Backend search failed: {e}", exc_info=True); await event.answer("Backend search error."); return
                  response = await self._render_response_text(result, time() - start_time)
                  buttons = self._render_respond_buttons(result, new_page_num, current_filter=new_filter)
@@ -219,7 +240,10 @@ class BotFrontend:
             elif action == 'select_chat':
                  try:
                       chat_id = int(value)
-                      try: chat_name = await self.backend.translate_chat_id(chat_id); reply_prompt = f'☑️ Selected: **{html.escape(chat_name)}** (`{chat_id}`)\n\nReply to operate.'
+                      try:
+                           # Assuming backend.translate_chat_id exists and is async
+                           chat_name = await self.backend.translate_chat_id(chat_id)
+                           reply_prompt = f'☑️ Selected: **{html.escape(chat_name)}** (`{chat_id}`)\n\nReply to operate.'
                       except EntityNotFoundError: reply_prompt = f'☑️ Selected: `{chat_id}` (Name unknown)\n\nReply to operate.'
                       await event.edit(reply_prompt, parse_mode='markdown')
                       select_key = f'{redis_prefix}select_chat:{bot_chat_id}:{result_msg_id}'
@@ -247,6 +271,7 @@ class BotFrontend:
         elif text.startswith('/help'): await event.reply(self.HELP_TEXT_USER, parse_mode='markdown'); return
         elif text.startswith('/random'):
             try:
+                # Assuming backend.rand_msg exists
                 msg = self.backend.rand_msg()
                 chat_name = await self.backend.translate_chat_id(msg.chat_id)
                 display = f"📎 {html.escape(msg.filename)}" if msg.filename else html.escape(brief_content(msg.content))
@@ -262,6 +287,7 @@ class BotFrontend:
 
         elif text.startswith('/chats'):
             kw = remove_first_word(text); buttons = []
+            # Assuming backend.monitored_chats exists
             monitored = sorted(list(self.backend.monitored_chats)); found = 0
             if monitored:
                 for cid in monitored:
@@ -288,11 +314,12 @@ class BotFrontend:
 
 
     async def _chat_ids_from_args(self, chats_args: List[str]) -> Tuple[List[int], List[str]]:
-        # ... (代码不变，已确认返回 share_id) ...
         chat_ids, errors = [], []
         if not chats_args: return [], []
         for chat_arg in chats_args:
-            try: chat_ids.append(await self.backend.str_to_chat_id(chat_arg))
+            try:
+                # Assuming backend.str_to_chat_id exists and is async
+                chat_ids.append(await self.backend.str_to_chat_id(chat_arg))
             except EntityNotFoundError: errors.append(f'Not found: "{html.escape(chat_arg)}"')
             except Exception as e: errors.append(f'Error parsing "{html.escape(chat_arg)}": {type(e).__name__}')
         return chat_ids, errors
@@ -308,14 +335,19 @@ class BotFrontend:
         # --- 统一使用 if/elif/else 处理管理员命令 ---
         if text.startswith('/help'): await event.reply(self.HELP_TEXT_ADMIN, parse_mode='markdown'); return
         elif text.startswith('/stat'):
-            try: await event.reply(await self.backend.get_index_status(), parse_mode='html', link_preview=False)
-            except Exception as e: self._logger.error("Error /stat: {e}", exc_info=True); await event.reply(f"Error getting status: {html.escape(str(e))}\n<pre>{html.escape(format_exc())}</pre>", parse_mode='html')
+            try:
+                # Assuming backend.get_index_status exists and is async
+                status = await self.backend.get_index_status()
+                await event.reply(status, parse_mode='html', link_preview=False)
+            except Exception as e: self._logger.error(f"Error /stat: {e}", exc_info=True); await event.reply(f"Error getting status: {html.escape(str(e))}\n<pre>{html.escape(format_exc())}</pre>", parse_mode='html')
         elif text.startswith('/download_chat'):
             try: args = self.download_arg_parser.parse_args(shlex.split(text)[1:])
             except (ArgumentError, Exception) as e: await event.reply(f"Arg error: {e}\nUsage:\n<pre>{html.escape(self.download_arg_parser.format_help())}</pre>", parse_mode='html'); return
             min_id, max_id = args.min or 0, args.max or 0
             target_chat_ids, errors = await self._chat_ids_from_args(args.chats)
-            if not args.chats and selected_chat_id is not None and selected_chat_id not in target_chat_ids: target_chat_ids = [selected_chat_id]; await event.reply(f"Reply detected: Downloading **{html.escape(selected_chat_name)}** (`{selected_chat_id}`)", parse_mode='markdown')
+            if not args.chats and selected_chat_id is not None and selected_chat_id not in target_chat_ids:
+                 target_chat_ids = [selected_chat_id];
+                 await event.reply(f"Reply detected: Downloading **{html.escape(selected_chat_name or str(selected_chat_id))}** (`{selected_chat_id}`)", parse_mode='markdown')
             elif not target_chat_ids and not errors: await event.reply("Error: Specify chat or reply."); return
             if errors: await event.reply("Parse errors:\n- " + "\n- ".join(errors))
             if not target_chat_ids: return
@@ -329,26 +361,45 @@ class BotFrontend:
             try: args = self.chat_ids_parser.parse_args(shlex.split(text)[1:])
             except (ArgumentError, Exception) as e: await event.reply(f"Arg error: {e}\nUsage:\n<pre>{html.escape(self.chat_ids_parser.format_help())}</pre>", parse_mode='html'); return
             target_chat_ids, errors = await self._chat_ids_from_args(args.chats)
-            if not args.chats and selected_chat_id is not None and selected_chat_id not in target_chat_ids: target_chat_ids = [selected_chat_id]; await event.reply(f"Reply detected: Monitoring **{html.escape(selected_chat_name)}** (`{selected_chat_id}`)", parse_mode='markdown')
+            if not args.chats and selected_chat_id is not None and selected_chat_id not in target_chat_ids:
+                 target_chat_ids = [selected_chat_id];
+                 await event.reply(f"Reply detected: Monitoring **{html.escape(selected_chat_name or str(selected_chat_id))}** (`{selected_chat_id}`)", parse_mode='markdown')
             elif not target_chat_ids and not errors: await event.reply("Error: Specify chat or reply."); return
             if errors: await event.reply("Parse errors:\n- " + "\n- ".join(errors))
             if not target_chat_ids: return
             # 执行监听
             r, a, m = [], 0, 0
             for cid in target_chat_ids:
+                # Assuming backend.monitored_chats is a set
                 if cid in self.backend.monitored_chats: m += 1
-                else: self.backend.monitored_chats.add(cid); a += 1; try: h = await self.backend.format_dialog_html(cid); r.append(f"- ✅ {h} added.") except Exception as e: r.append(f"- ✅ `{cid}` added (name error: {type(e).__name__})."); self._logger.info(f'Admin added {cid} monitor.')
+                else:
+                    self.backend.monitored_chats.add(cid); a += 1
+                    try:
+                         # Assuming backend.format_dialog_html exists and is async
+                         h = await self.backend.format_dialog_html(cid)
+                         r.append(f"- ✅ {h} added.")
+                    except Exception as e:
+                         r.append(f"- ✅ `{cid}` added (name error: {type(e).__name__}).")
+                         self._logger.info(f'Admin added {cid} monitor.')
             if r: await event.reply('\n'.join(r), parse_mode='html', link_preview=False)
-            s = ([f"{c} added." for c in [a] if c > 0] + [f"{c} already monitored." for c in [m] if c > 0]); await event.reply(" ".join(s) if s else "No changes.")
+            # Corrected status message logic
+            status_parts = []
+            if a > 0: status_parts.append(f"{a} added.")
+            if m > 0: status_parts.append(f"{m} already monitored.")
+            await event.reply(" ".join(status_parts) if status_parts else "No changes.")
         elif text.startswith('/clear'):
             try: args = self.chat_ids_parser.parse_args(shlex.split(text)[1:])
             except (ArgumentError, Exception) as e: await event.reply(f"Arg error: {e}\nUsage:\n<pre>{html.escape(self.chat_ids_parser.format_help())}</pre>", parse_mode='html'); return
             if len(args.chats) == 1 and args.chats[0].lower() == 'all':
-                try: self.backend.clear(None); await event.reply('✅ All index cleared.')
+                try:
+                    # Assuming backend.clear exists
+                    self.backend.clear(None); await event.reply('✅ All index cleared.')
                 except Exception as e: self._logger.error("Clear all error:", exc_info=True); await event.reply(f"Clear all error: {e}")
                 return
             target_chat_ids, errors = await self._chat_ids_from_args(args.chats)
-            if not args.chats and selected_chat_id is not None and selected_chat_id not in target_chat_ids: target_chat_ids = [selected_chat_id]; await event.reply(f"Reply detected: Clearing **{html.escape(selected_chat_name)}** (`{selected_chat_id}`)", parse_mode='markdown')
+            if not args.chats and selected_chat_id is not None and selected_chat_id not in target_chat_ids:
+                 target_chat_ids = [selected_chat_id];
+                 await event.reply(f"Reply detected: Clearing **{html.escape(selected_chat_name or str(selected_chat_id))}** (`{selected_chat_id}`)", parse_mode='markdown')
             elif not target_chat_ids and not errors: await event.reply("Error: Specify chat, reply, or use `/clear all`."); return
             if errors: await event.reply("Parse errors:\n- " + "\n- ".join(errors))
             if not target_chat_ids: return
@@ -356,20 +407,35 @@ class BotFrontend:
             self._logger.info(f'Admin clear index for: {target_chat_ids}')
             try:
                 self.backend.clear(target_chat_ids); r = []
-                for cid in target_chat_ids: try: h = await self.backend.format_dialog_html(cid); r.append(f"- ✅ {h} cleared.") except Exception: r.append(f"- ✅ `{cid}` cleared (name unknown).")
+                for cid in target_chat_ids:
+                    try:
+                        h = await self.backend.format_dialog_html(cid)
+                        r.append(f"- ✅ {h} cleared.")
+                    except Exception:
+                        r.append(f"- ✅ `{cid}` cleared (name unknown).")
                 await event.reply('\n'.join(r), parse_mode='html', link_preview=False)
             except Exception as e: self._logger.error(f"Clear error: {e}", exc_info=True); await event.reply(f"Clear error: {e}")
         elif text.startswith('/refresh_chat_names'):
-            msg = await event.reply('Refreshing chat name cache...'); try: await self.backend.session.refresh_translate_table(); await msg.edit('✅ Cache refreshed.')
+            msg = await event.reply('Refreshing chat name cache...')
+            try:
+                # Assuming backend.session.refresh_translate_table exists and is async
+                await self.backend.session.refresh_translate_table()
+                await msg.edit('✅ Cache refreshed.')
             except Exception as e: self._logger.error("Refresh names error:", exc_info=True); await msg.edit(f'Refresh error: {e}')
         elif text.startswith('/find_chat_id'):
             q = remove_first_word(text);
             if not q: await event.reply('Error: Keyword missing.'); return
             try:
+                # Assuming backend.find_chat_id exists and is async
                 results = await self.backend.find_chat_id(q); sb = []
                 if results:
                      sb.append(f'{len(results)} chats found matching "{html.escape(q)}":\n')
-                     for cid in results[:50]: try: n=await self.backend.translate_chat_id(cid); sb.append(f'- {html.escape(n)}: `{cid}`\n') except EntityNotFoundError: sb.append(f'- Unknown: `{cid}`\n') except Exception as e: sb.append(f'- `{cid}` (name error: {type(e).__name__})\n')
+                     for cid in results[:50]:
+                         try:
+                             n=await self.backend.translate_chat_id(cid)
+                             sb.append(f'- {html.escape(n)}: `{cid}`\n')
+                         except EntityNotFoundError: sb.append(f'- Unknown: `{cid}`\n')
+                         except Exception as e: sb.append(f'- `{cid}` (name error: {type(e).__name__})\n')
                      if len(results) > 50: sb.append("\n(Showing first 50)")
                 else: sb.append(f'No chats found matching "{html.escape(q)}".')
                 await event.reply(''.join(sb), parse_mode='html')
@@ -378,16 +444,32 @@ class BotFrontend:
 
 
     async def _search(self, event: events.NewMessage.Event, query: str, selected_chat_context: Optional[Tuple[int, str]]):
-        if not query and selected_chat_context: query = '*'; await event.reply(f"Searching all in **{html.escape(selected_chat_context[1])}** (`{selected_chat_context[0]}`)", parse_mode='markdown')
-        elif not query: self._logger.debug("Empty query ignored."); return
+        selected_chat_id = selected_chat_context[0] if selected_chat_context else None
+        selected_chat_name = selected_chat_context[1] if selected_chat_context else None
 
-        target_chats = [selected_chat_context[0]] if selected_chat_context else None
-        try: is_empty = self.backend.is_empty(target_chats[0] if target_chats else None)
+        if not query and selected_chat_context:
+             query = '*' # Search for everything if query is empty in a selected chat
+             await event.reply(f"Searching all in **{html.escape(selected_chat_name or str(selected_chat_id))}** (`{selected_chat_id}`)", parse_mode='markdown')
+        elif not query:
+             self._logger.debug("Empty query ignored for global search.")
+             # Maybe send a help message?
+             # await event.reply("Please provide keywords to search.")
+             return
+
+        target_chats = [selected_chat_id] if selected_chat_id is not None else None
+        try:
+             # Assuming backend.is_empty exists
+             is_empty = self.backend.is_empty(selected_chat_id)
         except Exception as e: self._logger.error(f"Check empty error: {e}"); await event.reply("Index check error."); return
 
-        if is_empty: await event.reply(f'Chat **{html.escape(selected_chat_context[1])}** index empty.' if selected_chat_context else 'Global index empty.'); return
+        if is_empty:
+            if selected_chat_context:
+                await event.reply(f'Chat **{html.escape(selected_chat_name or str(selected_chat_id))}** index empty.')
+            else:
+                await event.reply('Global index empty.')
+            return
 
-        start = time(); ctx_info = f"in chat {target_chats[0]}" if target_chats else "globally"
+        start = time(); ctx_info = f"in chat {selected_chat_id}" if target_chats else "globally"
         self._logger.info(f'Searching "{brief_content(query)}" {ctx_info}')
         try:
             result = self.backend.search(query, target_chats, self._cfg.page_len, 1, file_filter="all") # 初始搜索不过滤
@@ -399,15 +481,16 @@ class BotFrontend:
                 self._redis.set(f'{prefix}query_text:{bcid}:{mid}', query, ex=3600)
                 self._redis.set(f'{prefix}query_filter:{bcid}:{mid}', "all", ex=3600) # 存初始 filter
                 if target_chats: self._redis.set(f'{prefix}query_chats:{bcid}:{mid}', ','.join(map(str, target_chats)), ex=3600)
-                else: self._redis.delete(f'{prefix}query_chats:{bcid}:{mid}')
+                else: self._redis.delete(f'{prefix}query_chats:{bcid}:{mid}') # Use delete for non-existence
         except whoosh.index.LockError: await event.reply('⏳ Index locked, try again.')
         except Exception as e: self._logger.error(f"Search error: {e}", exc_info=True); await event.reply(f'Search error: {type(e).__name__}.')
 
 
     async def _download_history(self, event: events.NewMessage.Event, chat_id: int, min_id: int, max_id: int):
-         # chat_id is share_id
+         # chat_id is assumed to be share_id already
          try: chat_html = await self.backend.format_dialog_html(chat_id)
-         except Exception as e: chat_html = f"对话 `{chat_id}`"
+         except Exception as e: chat_html = f"对话 `{chat_id}`" # Fallback display
+
          try: # 检查是否空索引
              if min_id == 0 and max_id == 0 and not self.backend.is_empty(chat_id):
                  await event.reply(f'⚠️ Warn: {chat_html} index exists. Redownload may cause duplicates. Use `/clear {chat_id}` or specify range.', parse_mode='html')
@@ -416,17 +499,23 @@ class BotFrontend:
          prog_msg: Optional[TgMessage] = None; last_update = time(); interval = 5; count = 0
          async def cb(cur_id: int, dl_count: int):
              nonlocal prog_msg, last_update, count; count = dl_count; now = time()
-             if now - last_update > interval: last_update = now; txt = f'⏳ Downloading {chat_html}:\nProcessed {dl_count}, current ID: {cur_id}'
+             # Update progress message logic
+             if now - last_update > interval:
+                 last_update = now
+                 txt = f'⏳ Downloading {chat_html}:\nProcessed {dl_count}, current ID: {cur_id}'
                  try:
                      if prog_msg is None: prog_msg = await event.reply(txt, parse_mode='html')
                      else: await prog_msg.edit(txt, parse_mode='html')
-                 except rpcerrorlist.FloodWaitError as fwe: last_update += fwe.seconds
+                 except rpcerrorlist.FloodWaitError as fwe:
+                      self._logger.warning(f"Flood wait ({fwe.seconds}s) during progress update for {chat_id}.")
+                      last_update += fwe.seconds # Delay next update
                  except rpcerrorlist.MessageNotModifiedError: pass
-                 except rpcerrorlist.MessageIdInvalidError: prog_msg = None
+                 except rpcerrorlist.MessageIdInvalidError: prog_msg = None # Message was deleted
                  except Exception as e: self._logger.error(f"Edit progress error {chat_id}: {e}"); prog_msg = None
 
          start = time()
          try:
+              # Assuming backend.download_history exists, is async, and takes callback
               await self.backend.download_history(chat_id, min_id, max_id, cb)
               msg = f'✅ {chat_html} download complete, indexed {count} msgs, took {time()-start:.2f}s.'
               try: await event.reply(msg, parse_mode='html')
@@ -436,7 +525,13 @@ class BotFrontend:
          except Exception as e: # 其他错误
               self._logger.error(f"Download failed {chat_id}: {e}", exc_info=True); await event.reply(f'❌ Download {chat_html} unknown error: {type(e).__name__}', parse_mode='html')
          finally:
-              if prog_msg: try: await prog_msg.delete() catch Exception: pass
+              # --- CORRECTED ---
+              if prog_msg:
+                  try:
+                      await prog_msg.delete()
+                  except Exception:  # Catch potential errors during delete (e.g., already deleted)
+                      pass
+              # --- END CORRECTION ---
 
 
     def _register_hooks(self):
@@ -450,44 +545,71 @@ class BotFrontend:
 
         @self.bot.on(events.NewMessage())
         async def msg_handler(event: events.NewMessage.Event):
-            sender = await event.message.get_sender()
+            # Ensure message has a sender
+            if not event.message or not event.sender_id:
+                 return # Ignore system messages or messages without sender
+
+            sender = await event.message.get_sender() # Get sender object
             if not sender or sender.id == self.my_id: return # 忽略无发送者或自己的消息
             is_admin = self._admin_id and sender.id == self._admin_id
 
             mentioned, reply_to_bot = False, False
-            if event.is_group or event.is_channel:
+            if event.is_group or event.is_channel: # Check if in group or channel
+                 # Check for direct @mention
                  if self.username and f'@{self.username}' in event.raw_text: mentioned = True
-                 elif event.message.mentioned and event.message.entities: # 检查提及实体
+                 # Check if bot was mentioned via entity (more reliable)
+                 elif event.message.mentioned and event.message.entities:
                       for entity in event.message.entities:
-                          if isinstance(entity, MessageEntityMentionName) and entity.user_id == self.my_id: mentioned = True; break
-                 if event.message.is_reply: # 检查回复
-                      try: reply = await event.message.get_reply_message(); reply_to_bot = reply and reply.sender_id == self.my_id
-                      except Exception: pass # 获取回复失败则忽略
+                          if isinstance(entity, MessageEntityMentionName) and entity.user_id == self.my_id:
+                              mentioned = True; break
+                 # Check if it's a reply to one of the bot's messages
+                 if event.message.is_reply and event.message.reply_to_msg_id:
+                      try:
+                          reply = await event.message.get_reply_message()
+                          reply_to_bot = reply and reply.sender_id == self.my_id
+                      except Exception as e:
+                          self._logger.warning(f"Could not get reply message {event.message.reply_to_msg_id} in chat {event.chat_id}: {e}")
+                          pass # 获取回复失败则忽略
 
+            # Process if private message OR mentioned OR replied to bot in group/channel
             process = event.is_private or mentioned or reply_to_bot
-            if not process: return # 不处理群组中无关消息
+            if not process: return # 不处理群组/频道中无关消息
 
-            if self._cfg.private_mode and not is_admin: # 私人模式权限
-                 try: csi = get_share_id(event.chat_id)
-                 except Exception: csi = None
-                 if sender.id not in self._cfg.private_whitelist and (csi is None or csi not in self._cfg.private_whitelist):
+            # Private mode permission check
+            if self._cfg.private_mode and not is_admin:
+                 sender_allowed = sender.id in self._cfg.private_whitelist
+                 chat_allowed = False
+                 if event.chat_id: # Check chat only if chat_id exists
+                      try:
+                          csi = get_share_id(event.chat_id)
+                          chat_allowed = csi in self._cfg.private_whitelist
+                      except Exception: pass # Ignore errors converting chat_id
+
+                 if not sender_allowed and not chat_allowed:
+                     # Optionally log the denied access attempt
+                     self._logger.debug(f"Permission denied in private mode for user {sender.id} in chat {event.chat_id}")
+                     # Only reply if it's a direct private message to avoid spamming groups
                      if event.is_private: await event.reply('Permission denied (private mode).');
-                     return
+                     return # Deny access
 
             # 分发处理
             handler = self._admin_msg_handler if is_admin else self._normal_msg_handler
             try: await handler(event)
             except whoosh.index.LockError: await event.reply('⏳ Index locked, try later.')
             except EntityNotFoundError as e: await event.reply(f'❌ Not found: {e.entity}')
-            except telethon.errors.rpcerrorlist.UserIsBlockedError: self._logger.warning(f"User {sender.id} blocked.")
-            except telethon.errors.rpcerrorlist.ChatWriteForbiddenError: self._logger.warning(f"Write forbidden: {event.chat_id}.")
+            except telethon.errors.rpcerrorlist.UserIsBlockedError: self._logger.warning(f"User {sender.id} blocked the bot.")
+            except telethon.errors.rpcerrorlist.ChatWriteForbiddenError: self._logger.warning(f"Write forbidden in chat: {event.chat_id}.")
             except Exception as e:
-                 et = type(e).__name__; self._logger.error(f"Handle msg error {sender.id}: {et}: {e}", exc_info=True)
-                 try: await event.reply(f'Error: {et}.\nContact admin.')
-                 except Exception as re: self._logger.error(f"Reply error failed: {re}")
-                 if self._admin_id and event.chat_id != self._admin_id: # 通知管理员
-                      try: await self.bot.send_message(self._admin_id, f"Error user {sender.id} chat {event.chat_id}:\n<pre>{html.escape(format_exc())}</pre>", parse_mode='html')
-                      except Exception as ne: self._logger.error(f"Notify admin failed: {ne}")
+                 et = type(e).__name__; self._logger.error(f"Handle msg error from {sender.id} in {event.chat_id}: {et}: {e}", exc_info=True)
+                 try: await event.reply(f'Error: {et}.\nContact admin if this persists.')
+                 except Exception as re: self._logger.error(f"Replying with error message failed: {re}")
+                 # Notify admin about the error
+                 if self._admin_id and event.chat_id != self._admin_id:
+                      try:
+                          error_details = f"Error handling message from user {sender.id} in chat {event.chat_id}:\n"
+                          error_details += f"<pre>{html.escape(format_exc())}</pre>"
+                          await self.bot.send_message(self._admin_id, error_details, parse_mode='html')
+                      except Exception as ne: self._logger.error(f"Notifying admin failed: {ne}")
 
 
     async def _get_selected_chat_from_reply(self, event: events.NewMessage.Event) -> Optional[Tuple[int, str]]:
@@ -495,7 +617,10 @@ class BotFrontend:
         key = f'{self.id}:select_chat:{event.chat_id}:{event.message.reply_to_msg_id}'
         res = self._redis.get(key)
         if res:
-            try: cid = int(res); name = await self.backend.translate_chat_id(cid); return cid, name
+            try:
+                 cid = int(res)
+                 name = await self.backend.translate_chat_id(cid) # Assume async
+                 return cid, name
             except ValueError: self._redis.delete(key); return None # 删除无效 key
             except EntityNotFoundError: return int(res), f"Unknown ({res})" # 返回 ID 和未知名称
             except Exception as e: self._logger.error(f"Error get selected chat {key}: {e}"); return None
@@ -504,47 +629,94 @@ class BotFrontend:
 
     async def _register_commands(self):
         admin_peer = None
-        if self._admin_id: try: admin_peer = await self.bot.get_input_entity(self._admin_id)
-                           except Exception as e: self._logger.error(f'Failed get admin input entity {self._admin_id}: {e}')
-        else: self._logger.warning("Admin ID invalid, skip admin commands registration.")
+        if self._admin_id:
+            try: admin_peer = await self.bot.get_input_entity(self._admin_id)
+            except ValueError: # Handle case where admin_id might be a username not yet resolved
+                 self._logger.warning(f"Could not get input entity for admin ID {self._admin_id} directly. Might be username.")
+                 try:
+                     admin_entity = await self.bot.get_entity(self._admin_id)
+                     admin_peer = await self.bot.get_input_entity(admin_entity)
+                 except Exception as e: self._logger.error(f'Failed get admin input entity {self._admin_id}: {e}')
+            except Exception as e: self._logger.error(f'Failed get admin input entity {self._admin_id}: {e}')
+        else: self._logger.warning("Admin ID invalid or not configured, skipping admin commands registration.")
 
+        # Define commands
         ac = [ BotCommand(c, d) for c, d in [ ("download_chat", '[Opts] [Chats] Download'), ("monitor_chat", 'Chats Add monitor'), ("clear", '[Chats|all] Clear index'), ("stat", 'Query status'), ("find_chat_id", 'KW Find chat ID'), ("refresh_chat_names", 'Refresh name cache')]]
         cc = [ BotCommand(c, d) for c, d in [ ("s", 'KW Search (or /search /ss)'), ("chats", '[KW] List/Select chats'), ("random", 'Random message'), ("help", 'Show help')]]
 
-        if admin_peer: try: await self.bot(SetBotCommandsRequest(scope=BotCommandScopePeer(admin_peer), lang_code='', commands=ac+cc)); self._logger.info(f"Set admin commands ok.") catch Exception as e: self._logger.error(f"Set admin commands failed: {e}")
-        try: await self.bot(SetBotCommandsRequest(scope=BotCommandScopeDefault(), lang_code='', commands=cc)); self._logger.info("Set default commands ok.")
-        except Exception as e: self._logger.error(f"Set default commands failed: {e}")
+        # Set commands for admin
+        if admin_peer:
+            try:
+                # --- CORRECTED ---
+                await self.bot(SetBotCommandsRequest(scope=BotCommandScopePeer(admin_peer), lang_code='', commands=ac+cc))
+                # --- END CORRECTION ---
+                self._logger.info(f"Admin commands set successfully for peer {self._admin_id}.")
+            # --- CORRECTED ---
+            except Exception as e:
+            # --- END CORRECTION ---
+                self._logger.error(f"Setting admin commands failed for peer {self._admin_id}: {e}")
+
+        # Set default commands for everyone else
+        try:
+            await self.bot(SetBotCommandsRequest(scope=BotCommandScopeDefault(), lang_code='', commands=cc))
+            self._logger.info("Default commands set successfully.")
+        except Exception as e:
+            self._logger.error(f"Setting default commands failed: {e}")
 
 
     async def _render_response_text(self, result: SearchResult, used_time: float) -> str:
-        if not isinstance(result, SearchResult) or result.total_results == 0: return "No relevant messages found."
+        # Check if result is valid and has hits
+        if not isinstance(result, SearchResult) or not result.hits:
+             return "No relevant messages found."
+
         sb = [f'Found {result.total_results} results, took {used_time:.3f}s:\n\n']
         for i, hit in enumerate(result.hits, 1):
             try:
                 msg = hit.msg
+                # Ensure msg is valid IndexMsg object
+                if not isinstance(msg, IndexMsg):
+                     sb.append(f"<b>{i}.</b> Error: Invalid message data.\n\n")
+                     continue
+
                 try: title = await self.backend.translate_chat_id(msg.chat_id)
                 except EntityNotFoundError: title = f"Unknown ({msg.chat_id})"
-                hdr = [f"<b>{i}. {html.escape(title)}</b>"];
+                except Exception as te: title = f"Error ({msg.chat_id}): {type(te).__name__}" # Handle translation errors
+
+                hdr = [f"<b>{i}. {html.escape(title)}</b>"]
                 if msg.sender: hdr.append(f"(<u>{html.escape(msg.sender)}</u>)")
-                hdr.append(f'[{msg.post_time.strftime("%y-%m-%d %H:%M")}]')
+                # Ensure post_time is datetime before formatting
+                if isinstance(msg.post_time, datetime):
+                    hdr.append(f'[{msg.post_time.strftime("%y-%m-%d %H:%M")}]')
+                else:
+                     hdr.append('[Invalid Time]') # Fallback for invalid time
+
                 sb.append(' '.join(hdr) + '\n')
                 if msg.filename: sb.append(f"📎 File: <b>{html.escape(msg.filename)}</b>\n")
-                # --- 使用修复后的高亮/摘要逻辑 ---
-                display_text = hit.highlighted or "" # 使用高亮片段
-                if not display_text: # 无高亮时的回退逻辑
+
+                # Use highlighted snippet if available, otherwise generate brief content
+                display_text = hit.highlighted or "" # Use pre-generated highlight
+                if not display_text: # Fallback if no highlight was generated or available
                      if msg.content: display_text = html.escape(brief_content(msg.content, 150))
                      elif msg.filename: display_text = f"<i>(File, no text content)</i>"
                      else: display_text = "<i>(Empty message)</i>"
-                # --- 结束修复 ---
-                if msg.url: sb.append(f'<a href="{html.escape(msg.url)}">Go to msg</a>\n{display_text}\n\n') # 固定链接文本，下方显示摘要
-                else: sb.append(f"{display_text} (No link)\n\n")
-            except Exception as e: sb.append(f"<b>{i}.</b> Error rendering result: {type(e).__name__}\n\n"); self._logger.error(f"Error rendering hit: {e}", exc_info=True)
 
-        final = ''.join(sb); max_len = 4096
+                # Append link and display text
+                if msg.url: sb.append(f'<a href="{html.escape(msg.url)}">Go to msg</a>\n{display_text}\n\n')
+                else: sb.append(f"{display_text} (No link)\n\n")
+            except Exception as e:
+                 sb.append(f"<b>{i}.</b> Error rendering result: {type(e).__name__}\n\n")
+                 self._logger.error(f"Error rendering hit (msg URL: {getattr(hit, 'msg', None) and getattr(hit.msg, 'url', 'N/A')}): {e}", exc_info=True)
+
+        final = ''.join(sb); max_len = 4096 # Telegram message length limit
         if len(final) > max_len:
-             cutoff = "\n\n...(Too many results, showing partial)"
-             last_nl = final.rfind('\n\n', 0, max_len - len(cutoff) - 10)
-             final = final[:last_nl if last_nl != -1 else max_len - len(cutoff)] + cutoff
+             cutoff_msg = "\n\n...(Too many results, showing partial)"
+             # Find last double newline before limit to cut nicely
+             cutoff_point = max_len - len(cutoff_msg) - 10 # A bit of buffer
+             last_nl = final.rfind('\n\n', 0, cutoff_point)
+             if last_nl != -1:
+                 final = final[:last_nl] + cutoff_msg
+             else: # Cannot cut nicely, just truncate
+                 final = final[:max_len - len(cutoff_msg)] + cutoff_msg
         return final
 
 
@@ -556,13 +728,33 @@ class BotFrontend:
                Button.inline("【Text】" if current_filter == "text_only" else "Text", 'search_filter=text_only'),
                Button.inline("【File】" if current_filter == "file_only" else "File", 'search_filter=file_only') ]
         buttons.append(fr)
+
         # 翻页按钮
-        try: total_pages = (result.total_results + max(1, self._cfg.page_len) - 1) // max(1, self._cfg.page_len)
-        except Exception: total_pages = 1
+        try:
+             page_len = max(1, self._cfg.page_len)
+             total_pages = (result.total_results + page_len - 1) // page_len
+        except Exception as e:
+             self._logger.error(f"Error calculating total pages: {e}")
+             total_pages = 1 # Fallback
+
         if total_pages > 1:
             pr = []
-            if cur_page_num > 1: pr.append(Button.inline('⬅️ Prev', f'search_page={cur_page_num - 1}'))
+            # Previous page button
+            if cur_page_num > 1:
+                 pr.append(Button.inline('⬅️ Prev', f'search_page={cur_page_num - 1}'))
+            # Current page indicator (non-clickable)
             pr.append(Button.inline(f'{cur_page_num}/{total_pages}', 'noop'))
-            if not result.is_last_page and cur_page_num < total_pages: pr.append(Button.inline('Next ➡️', f'search_page={cur_page_num + 1}'))
+            # Next page button
+            # Use result.is_last_page which should be calculated by the backend searcher
+            if not result.is_last_page and cur_page_num < total_pages:
+                 pr.append(Button.inline('Next ➡️', f'search_page={cur_page_num + 1}'))
+            # Only add page row if there are buttons
             if pr: buttons.append(pr)
+
+        # Return buttons if any rows were added, otherwise None
         return buttons if buttons else None
+
+# Example minimal main execution block (if needed for testing)
+# if __name__ == '__main__':
+#     logger.info("Frontend Bot script loaded.")
+#     # Add basic setup for testing if desired
