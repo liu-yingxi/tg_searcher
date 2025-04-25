@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import html
+import re # [新增] 导入 re 用于剥离 HTML 标签
 from time import time
 from typing import Optional, List, Tuple, Set, Union, Any
 from datetime import datetime
@@ -16,7 +17,7 @@ from telethon.tl.custom import Message as TgMessage
 from telethon.tl.functions.bots import SetBotCommandsRequest
 import telethon.errors.rpcerrorlist as rpcerrorlist
 from redis import Redis
-from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import ConnectionError as RedisConnectionError, ResponseError as RedisResponseError # [修改] 导入 RedisResponseError
 
 # Assuming these imports work from your project structure
 try:
@@ -31,7 +32,8 @@ except ImportError:
     def get_logger(name): import logging; return logging.getLogger(name)
     def get_share_id(x): return int(x) if x else 0
     def remove_first_word(s): return ' '.join(s.split()[1:]) if len(s.split()) > 1 else ''
-    def brief_content(s, l=50): return (s[:l] + '...') if len(s) > l else s
+    # [修改] 更新 brief_content 的默认值以匹配新需求，但函数调用处会覆盖
+    def brief_content(s, l=35): return (s[:l] + '...') if len(s) > l else s
     class BackendBot: pass
     class EntityNotFoundError(Exception): pass
     class SearchResult: pass
@@ -108,26 +110,23 @@ class FakeRedis:
     def ping(self): return True # 总是认为连接正常
     def sadd(self, key, *values):
         """模拟 SADD"""
-        # [修改] 确保 key 存在且为 set，处理过期
         current_set, expiry = self._data.get(key, (set(), None))
         if not isinstance(current_set, set): current_set = set()
-        if expiry is not None and expiry <= time(): current_set = set(); expiry = None # 过期则清空
+        if expiry is not None and expiry <= time(): current_set = set(); expiry = None
         added_count = 0
-        str_values = {str(v) for v in values} # 确保值是字符串
+        str_values = {str(v) for v in values}
         for v in str_values:
             if v not in current_set: current_set.add(v); added_count += 1
-        self._data[key] = (current_set, expiry) # 重新设置值和过期时间（如果未过期）
+        self._data[key] = (current_set, expiry)
         return added_count
     def scard(self, key):
         """模拟 SCARD"""
-        # [修改] 处理过期
         v = self._data.get(key)
         if v and isinstance(v[0], set) and (v[1] is None or v[1] > time()): return len(v[0])
-        elif v and v[1] is not None and v[1] <= time(): del self._data[key] # 过期删除
+        elif v and v[1] is not None and v[1] <= time(): del self._data[key]
         return 0
     def expire(self, key, seconds):
         """模拟 EXPIRE"""
-        # [修改] 确保 key 存在
         if key in self._data:
             value, _ = self._data[key]
             self._data[key] = (value, time() + seconds)
@@ -137,7 +136,7 @@ class FakeRedis:
 
 class BotFrontend:
     """处理用户交互、命令解析、结果展示的前端 Bot 类"""
-    # 帮助文本
+    # 帮助文本 (保持不变)
     HELP_TEXT_USER = """
 **可用命令:**
 /s `关键词` - 搜索消息 (或 `/search`, `/ss`；直接发送也可)。
@@ -168,6 +167,8 @@ class BotFrontend:
 - 回复选择成功的消息 + 搜索词，可仅搜索该对话。
 - 回复选择成功的消息 + 管理命令 (如 /download_chat)，可对该对话执行操作。
 """
+    # [新增] 文本显示最大字符数
+    MAX_TEXT_DISPLAY_LENGTH = 35
 
     def __init__(self, common_cfg: CommonBotConfig, cfg: BotFrontendConfig, frontend_id: str, backend: BackendBot):
         self.backend = backend # 后端 Bot 实例
@@ -189,6 +190,11 @@ class BotFrontend:
                 logger.critical(f'Redis connection failed {cfg.redis_host}: {e}. Falling back to FakeRedis.')
                 self._redis = FakeRedis()
                 self._cfg.no_redis = True
+            # [修改] 捕获 Redis 配置错误 (MISCONF)
+            except RedisResponseError as e:
+                logger.critical(f'Redis configuration error (MISCONF?) {cfg.redis_host}: {e}. Falling back to FakeRedis.')
+                self._redis = FakeRedis()
+                self._cfg.no_redis = True # 强制禁用 Redis，因为服务器配置有问题
             except Exception as e:
                 logger.critical(f'Redis init error {cfg.redis_host}: {e}. Falling back to FakeRedis.')
                 self._redis = FakeRedis()
@@ -199,7 +205,7 @@ class BotFrontend:
         self.username: Optional[str] = None # Bot 的用户名
         self.my_id: Optional[int] = None # Bot 自身的 User ID
 
-        # [新增] Redis Keys for stats
+        # Redis Keys for stats
         self._TOTAL_USERS_KEY = f'{self.id}:total_users'
         self._ACTIVE_USERS_KEY = f'{self.id}:active_users_15m'
         self._ACTIVE_USER_TTL = 900 # 15 minutes in seconds
@@ -246,6 +252,11 @@ class BotFrontend:
                  self._logger.critical(f'Redis check failed during start: {e}. Falling back to FakeRedis.')
                  self._redis = FakeRedis()
                  self._cfg.no_redis = True
+             # [修改] 启动时也检查 Redis 配置错误
+             except RedisResponseError as e:
+                 self._logger.critical(f'Redis configuration error (MISCONF?) during start {self._cfg.redis_host}: {e}. Falling back to FakeRedis.')
+                 self._redis = FakeRedis()
+                 self._cfg.no_redis = True
 
         self._logger.info(f'Starting frontend bot {self.id}...')
         try:
@@ -268,7 +279,6 @@ class BotFrontend:
             # 向管理员发送启动成功消息和初始状态
             if self._admin_id:
                  try:
-                     # [修改] 调整获取状态的长度限制
                      status_msg = await self.backend.get_index_status(4000 - 100) # 留出更多余地
                      msg = f'✅ Bot frontend init complete ({self.id})\n\n{status_msg}'
                      await self.bot.send_message(self._admin_id, msg, parse_mode='html', link_preview=False)
@@ -283,31 +293,36 @@ class BotFrontend:
             # Consider raising the exception or exiting if start fails critically
             # raise e
 
-    # [新增] 用户活动追踪
     def _track_user_activity(self, user_id: Optional[int]):
         """使用 Redis Set 记录用户活动，用于统计。"""
         if not user_id or user_id == self._admin_id or user_id == self.my_id or self._cfg.no_redis: return
         try:
             user_id_str = str(user_id)
             if isinstance(self._redis, FakeRedis):
-                # FakeRedis 不支持 pipeline，单独调用
                 self._redis.sadd(self._TOTAL_USERS_KEY, user_id_str)
                 self._redis.sadd(self._ACTIVE_USERS_KEY, user_id_str)
                 self._redis.expire(self._ACTIVE_USERS_KEY, self._ACTIVE_USER_TTL)
             else:
-                # 使用 pipeline 提高效率
                 pipe = self._redis.pipeline()
                 pipe.sadd(self._TOTAL_USERS_KEY, user_id_str)
                 pipe.sadd(self._ACTIVE_USERS_KEY, user_id_str)
                 pipe.expire(self._ACTIVE_USERS_KEY, self._ACTIVE_USER_TTL)
                 pipe.execute()
+        # [修改] 特别处理 Redis 配置错误，避免反复记录日志
+        except RedisResponseError as e:
+            if "MISCONF" in str(e):
+                 logger.error(f"Redis MISCONF error during usage tracking. Disabling Redis for this frontend instance. Error: {e}")
+                 self._redis = FakeRedis() # Fallback to FakeRedis
+                 self._cfg.no_redis = True # Mark as disabled
+            else:
+                 logger.warning(f"Redis usage tracking failed for user {user_id}: {e}")
         except Exception as e: logger.warning(f"Redis usage tracking failed for user {user_id}: {e}")
 
     async def _callback_handler(self, event: events.CallbackQuery.Event):
         """处理按钮回调"""
         try:
             self._logger.info(f'Callback: {event.sender_id} in {event.chat_id}, msg={event.message_id}, data={event.data!r}')
-            self._track_user_activity(event.sender_id) # [新增] 记录活动
+            self._track_user_activity(event.sender_id) # 记录活动
 
             if not event.data: await event.answer("无效操作。"); return
             try: query_data = event.data.decode('utf-8')
@@ -326,33 +341,41 @@ class BotFrontend:
 
             # --- 处理翻页和筛选 ---
             if action == 'search_page' or action == 'search_filter':
-                 new_page_num, new_filter = 1, "all" # 默认值
-                 if action == 'search_page':
-                      try: new_page_num = int(value); assert new_page_num > 0
-                      except (ValueError, AssertionError): await event.answer("无效页码。"); return
-                      new_filter = self._redis.get(filter_key) or "all" # 保持当前 filter
-                 else: # action == 'search_filter'
-                      new_filter = value if value in ["all", "text_only", "file_only"] else "all"
-                      self._redis.set(filter_key, new_filter, ex=3600) # 更新 filter, 回到第一页
-                      new_page_num = 1 # 筛选后回到第一页
+                 current_filter = self._redis.get(filter_key) or "all"
+                 current_chats_str = self._redis.get(chats_key)
+                 current_query = self._redis.get(query_key)
 
-                 # 从 Redis 获取搜索上下文
-                 q = self._redis.get(query_key)
-                 chats_str = self._redis.get(chats_key)
-                 if q is None: # 检查上下文是否已过期
+                 if current_query is None: # 检查上下文是否已过期
                      try: await event.edit("搜索信息已过期，请重新搜索。")
                      except Exception: pass
                      self._redis.delete(query_key, chats_key, filter_key); await event.answer("搜索已过期。"); return
 
-                 chats = [int(cid) for cid in chats_str.split(',')] if chats_str else None
-                 self._logger.info(f'Callback Query:"{brief_content(q)}" chats={chats} filter={new_filter} page={new_page_num}')
+                 new_page_num, new_filter = 1, current_filter # 默认值
+                 if action == 'search_page':
+                      try: new_page_num = int(value); assert new_page_num > 0
+                      except (ValueError, AssertionError): await event.answer("无效页码。"); return
+                      # new_filter 保持 current_filter
+                 else: # action == 'search_filter'
+                      new_filter = value if value in ["all", "text_only", "file_only"] else "all"
+                      if new_filter != current_filter: # 仅当 filter 改变时才更新并回第一页
+                           self._redis.set(filter_key, new_filter, ex=3600) # 更新 filter
+                           new_page_num = 1 # 筛选后回到第一页
+                      else: # filter 未变，保持当前页
+                          new_page_num = int(self._redis.get(f'{redis_prefix}query_page:{bot_chat_id}:{result_msg_id}') or 1) # 尝试获取当前页码
+
+
+                 chats = [int(cid) for cid in current_chats_str.split(',')] if current_chats_str else None
+                 self._logger.info(f'Callback Query:"{brief_content(current_query, 50)}" chats={chats} filter={new_filter} page={new_page_num}')
+
+                 # [新增] 存储当前页码，以便在 filter 未变时恢复
+                 self._redis.set(f'{redis_prefix}query_page:{bot_chat_id}:{result_msg_id}', new_page_num, ex=3600)
+
                  start_time = time()
-                 try: result = self.backend.search(q, chats, self._cfg.page_len, new_page_num, file_filter=new_filter)
+                 try: result = self.backend.search(current_query, chats, self._cfg.page_len, new_page_num, file_filter=new_filter)
                  except Exception as e: self._logger.error(f"Backend search failed during callback: {e}", exc_info=True); await event.answer("后端搜索错误。"); return
 
                  # 重新渲染消息
                  response = await self._render_response_text(result, time() - start_time)
-                 # [修改] 传递 new_filter
                  buttons = self._render_respond_buttons(result, new_page_num, current_filter=new_filter)
                  try: await event.edit(response, parse_mode='html', buttons=buttons, link_preview=False); await event.answer()
                  except rpcerrorlist.MessageNotModifiedError: await event.answer() # 消息未改变也需 answer
@@ -381,9 +404,18 @@ class BotFrontend:
                  await event.answer()
             else: # 未知 action
                  await event.answer("未知操作。")
+        # [修改] 捕获 Redis 配置错误
+        except RedisResponseError as e:
+            logger.error(f"Redis MISCONF error during callback: {e}")
+            if "MISCONF" in str(e) and not self._cfg.no_redis: # Check if not already fallen back
+                self._redis = FakeRedis()
+                self._cfg.no_redis = True
+                logger.error("Falling back to FakeRedis due to MISCONF error during callback.")
+            try: await event.answer("缓存服务暂时遇到问题，请稍后再试或联系管理员。", alert=True)
+            except Exception: pass
         except Exception as e:
              self._logger.error(f"Exception in callback handler: {e}", exc_info=True)
-             try: await event.answer("内部错误。")
+             try: await event.answer("内部错误。", alert=True)
              except Exception as final_e: self._logger.error(f"Failed to answer callback after error: {final_e}")
 
 
@@ -392,7 +424,7 @@ class BotFrontend:
         text: str = event.raw_text.strip()
         sender_id = event.sender_id
         self._logger.info(f'User {sender_id} chat {event.chat_id}: "{brief_content(text, 100)}"')
-        self._track_user_activity(sender_id) # [新增] 记录活动
+        self._track_user_activity(sender_id) # 记录活动
         selected_chat_context = await self._get_selected_chat_from_reply(event)
 
         if not text or text.startswith('/start'):
@@ -404,26 +436,29 @@ class BotFrontend:
                 msg = self.backend.rand_msg()
                 try: chat_name = await self.backend.translate_chat_id(msg.chat_id)
                 except EntityNotFoundError: chat_name = f"未知对话 ({msg.chat_id})"
-                # 构建随机消息回复
+                # 构建随机消息回复 (与搜索结果渲染逻辑保持一致)
                 respond = f'随机消息来自 **{html.escape(chat_name)}** (`{msg.chat_id}`)\n'
-                if msg.sender: respond += f'发送者: {html.escape(msg.sender)}\n'
+                # [修改] 移除 sender name
+                # if msg.sender: respond += f'发送者: {html.escape(msg.sender)}\n'
                 respond += f'时间: {msg.post_time.strftime("%Y-%m-%d %H:%M")}\n'
-                # --- 应用链接优化逻辑 (同样适用于 /random) ---
                 link_added = False
                 if msg.filename and msg.url:
                     respond += f'<a href="{html.escape(msg.url)}">📎 {html.escape(msg.filename)}</a>\n'
                     link_added = True
-                elif msg.filename: # 只有文件名
+                elif msg.filename:
                     respond += f"📎 {html.escape(msg.filename)}\n"
-                # 处理文本内容
+
                 if msg.content:
-                    content_display = html.escape(brief_content(msg.content)) # 使用 brief_content
-                    if not link_added and msg.url: # 如果前面没加链接，这里加
+                    # [修改] 应用简短内容限制
+                    content_display = html.escape(brief_content(msg.content, self.MAX_TEXT_DISPLAY_LENGTH))
+                    if not link_added and msg.url:
                         respond += f'<a href="{html.escape(msg.url)}">跳转到消息</a>\n'
                     respond += f'{content_display}\n'
-                elif not link_added and msg.url: # 既无文件也无文本，确保有链接
-                    respond += f'<a href="{html.escape(msg.url)}">跳转到消息</a>\n<i>(空消息)</i>\n'
-                # --- 结束链接优化 ---
+                elif not link_added and msg.url: # 既无文件也无文本
+                    respond += f'<a href="{html.escape(msg.url)}">跳转到消息</a>\n'
+                    # [修改] 移除 (空消息)
+                    # respond += f'<i>(空消息)</i>\n'
+
             except IndexError: respond = '错误：索引库为空。'
             except EntityNotFoundError as e: respond = f"错误：源对话 `{e.entity}` 未找到。"
             except Exception as e: self._logger.error(f"Error handling /random: {e}", exc_info=True); respond = f"获取随机消息时出错: {type(e).__name__}"
@@ -485,7 +520,7 @@ class BotFrontend:
         selected_chat_context = await self._get_selected_chat_from_reply(event)
         selected_chat_id = selected_chat_context[0] if selected_chat_context else None
         selected_chat_name = selected_chat_context[1] if selected_chat_context else None
-        self._track_user_activity(event.sender_id) # [新增] 记录管理员活动
+        self._track_user_activity(event.sender_id) # 记录管理员活动
 
         # --- 管理员命令处理 ---
         if text.startswith('/help'):
@@ -572,7 +607,6 @@ class BotFrontend:
                  else: sb.append(f'未找到与 "{html.escape(q)}" 匹配的对话。')
                  await event.reply(''.join(sb), parse_mode='html')
              except Exception as e: self._logger.error(f"Find chat ID error: {e}", exc_info=True); await event.reply(f"查找对话 ID 时出错: {e}")
-        # [修改] /refresh_chat_names 添加反馈
         elif text.startswith('/refresh_chat_names'):
             msg: Optional[TgMessage] = None
             try:
@@ -586,22 +620,31 @@ class BotFrontend:
                     try: await msg.edit(error_text)
                     except Exception: await event.reply(error_text) # 编辑失败则发送新消息
                 else: await event.reply(error_text) # 初始消息发送失败
-        # [新增] /usage 命令处理
         elif text.startswith('/usage'):
              if self._cfg.no_redis: await event.reply("使用统计功能需要 Redis (当前已禁用)。"); return
              try:
                  total_count = 0; active_count = 0
                  if isinstance(self._redis, FakeRedis):
-                     # FakeRedis 不支持 pipeline
                      total_count = self._redis.scard(self._TOTAL_USERS_KEY)
                      active_count = self._redis.scard(self._ACTIVE_USERS_KEY)
                  else:
-                     pipe = self._redis.pipeline()
-                     pipe.scard(self._TOTAL_USERS_KEY)
-                     pipe.scard(self._ACTIVE_USERS_KEY)
-                     results = pipe.execute()
-                     total_count = results[0] if results and len(results) > 0 else 0
-                     active_count = results[1] if results and len(results) > 1 else 0
+                     # [修改] 捕获 Redis 错误
+                     try:
+                         pipe = self._redis.pipeline()
+                         pipe.scard(self._TOTAL_USERS_KEY)
+                         pipe.scard(self._ACTIVE_USERS_KEY)
+                         results = pipe.execute()
+                         total_count = results[0] if results and len(results) > 0 else 0
+                         active_count = results[1] if results and len(results) > 1 else 0
+                     except RedisResponseError as e:
+                         logger.error(f"Redis MISCONF error during usage check: {e}")
+                         await event.reply(f"获取使用统计时出错: Redis 服务器配置错误 (MISCONF)。")
+                         return # Don't proceed further
+                     except RedisConnectionError as e:
+                         logger.error(f"Redis connection error during usage check: {e}")
+                         await event.reply(f"获取使用统计时出错: 无法连接到 Redis。")
+                         return
+
                  await event.reply(f"📊 **使用统计**\n- 总独立用户数: {total_count}\n- 活跃用户数 (最近15分钟): {active_count}", parse_mode='markdown')
              except Exception as e: self._logger.error(f"Failed to get usage stats: {e}", exc_info=True); await event.reply(f"获取使用统计时出错: {html.escape(str(e))}")
         else:
@@ -632,23 +675,41 @@ class BotFrontend:
             return
 
         start = time(); ctx_info = f"在对话 {selected_chat_id} 中" if target_chats else "全局"
-        self._logger.info(f'正在搜索 "{brief_content(query)}" ({ctx_info})')
+        self._logger.info(f'正在搜索 "{brief_content(query, 50)}" ({ctx_info})')
         try:
             # 执行搜索 (初始 filter 为 'all')
             result = self.backend.search(query, target_chats, self._cfg.page_len, 1, file_filter="all")
             # 渲染结果
             text = await self._render_response_text(result, time() - start)
-            # [修改] 传递初始 filter
             buttons = self._render_respond_buttons(result, 1, current_filter="all")
             # 发送回复
             msg = await event.reply(text, parse_mode='html', buttons=buttons, link_preview=False)
             # 存储上下文到 Redis
-            if msg:
-                prefix, bcid, mid = f'{self.id}:', event.chat_id, msg.id
-                self._redis.set(f'{prefix}query_text:{bcid}:{mid}', query, ex=3600)
-                self._redis.set(f'{prefix}query_filter:{bcid}:{mid}', "all", ex=3600) # 存初始 filter
-                if target_chats: self._redis.set(f'{prefix}query_chats:{bcid}:{mid}', ','.join(map(str, target_chats)), ex=3600)
-                else: self._redis.delete(f'{prefix}query_chats:{bcid}:{mid}') # 全局搜索则删除此 key
+            if msg and not self._cfg.no_redis: # Check if redis is enabled
+                try:
+                    prefix, bcid, mid = f'{self.id}:', event.chat_id, msg.id
+                    # 使用 pipeline 减少网络往返
+                    pipe = self._redis.pipeline()
+                    pipe.set(f'{prefix}query_text:{bcid}:{mid}', query, ex=3600)
+                    pipe.set(f'{prefix}query_filter:{bcid}:{mid}', "all", ex=3600) # 存初始 filter
+                    pipe.set(f'{prefix}query_page:{bcid}:{mid}', 1, ex=3600) # 存初始页码
+                    if target_chats: pipe.set(f'{prefix}query_chats:{bcid}:{mid}', ','.join(map(str, target_chats)), ex=3600)
+                    else: pipe.delete(f'{prefix}query_chats:{bcid}:{mid}') # 全局搜索则删除此 key
+                    pipe.execute()
+                # [修改] 捕获 Redis 错误并警告，但不中断流程
+                except RedisResponseError as e:
+                    logger.error(f"Redis MISCONF error saving search context: {e}")
+                    if "MISCONF" in str(e): # Check if it's the specific error
+                         self._redis = FakeRedis(); self._cfg.no_redis = True
+                         logger.error("Falling back to FakeRedis due to MISCONF error.")
+                         await event.reply("⚠️ 缓存服务暂时遇到问题，翻页和筛选功能可能受限。") # Notify user
+                except RedisConnectionError as e:
+                    logger.error(f"Redis connection error saving search context: {e}")
+                    # Don't necessarily disable redis for connection errors, maybe temporary
+                    await event.reply("⚠️ 无法连接到缓存服务，翻页和筛选功能可能受限。")
+                except Exception as e:
+                     logger.error(f"Failed to save search context to Redis: {e}")
+
         except whoosh.index.LockError: await event.reply('⏳ 索引当前正忙，请稍后再试。')
         except Exception as e: self._logger.error(f"Search execution error: {e}", exc_info=True); await event.reply(f'搜索时发生错误: {type(e).__name__}。')
 
@@ -670,12 +731,11 @@ class BotFrontend:
         prog_msg: Optional[TgMessage] = None
         last_update = time(); interval = 5; count = 0
 
-        # [修改] 进度回调函数，确保文本是中文
+        # 进度回调函数 (中文)
         async def cb(cur_id: int, dl_count: int):
             nonlocal prog_msg, last_update, count; count = dl_count; now = time()
             if now - last_update > interval: # 控制更新频率
                 last_update = now
-                # 使用中文提示
                 txt = f'⏳ 正在下载 {chat_html}:\n已处理 {dl_count} 条，当前消息 ID: {cur_id}'
                 try:
                     if prog_msg is None: prog_msg = await event.reply(txt, parse_mode='html')
@@ -691,7 +751,6 @@ class BotFrontend:
             await self.backend.download_history(chat_id, min_id, max_id, cb)
             msg = f'✅ {chat_html} 下载完成，索引了 {count} 条消息，耗时 {time()-start:.2f} 秒。'
             try:
-                # [修改] 如果有进度消息，编辑它；否则发送新消息
                 if prog_msg: await prog_msg.edit(msg, parse_mode='html')
                 else: await event.reply(msg, parse_mode='html')
                 prog_msg = None # 防止 finally 再次删除
@@ -765,6 +824,16 @@ class BotFrontend:
             except EntityNotFoundError as e: await event.reply(f'❌ 未找到相关实体: {e.entity}')
             except rpcerrorlist.UserIsBlockedError: self._logger.warning(f"User {sender.id} blocked the bot.")
             except rpcerrorlist.ChatWriteForbiddenError: self._logger.warning(f"Write forbidden in chat: {event.chat_id}.")
+            # [修改] 捕获 Redis 配置错误
+            except RedisResponseError as e:
+                 logger.error(f"Redis MISCONF error during message handling: {e}")
+                 if "MISCONF" in str(e) and not self._cfg.no_redis: # Check if not already fallen back
+                     self._redis = FakeRedis(); self._cfg.no_redis = True
+                     logger.error("Falling back to FakeRedis due to MISCONF error during message handling.")
+                     await event.reply("处理请求时遇到缓存服务问题，请稍后再试。")
+                 else: # Other Redis errors
+                     await event.reply(f'处理请求时发生 Redis 错误: {type(e).__name__}。')
+
             except Exception as e: # 通用错误处理
                  et = type(e).__name__; self._logger.error(f"Error handling message from {sender.id} in {event.chat_id}: {et}: {e}", exc_info=True)
                  try: await event.reply(f'处理您的请求时发生错误: {et}。\n如果问题持续存在，请联系管理员。')
@@ -780,6 +849,7 @@ class BotFrontend:
     async def _get_selected_chat_from_reply(self, event: events.NewMessage.Event) -> Optional[Tuple[int, str]]:
         """检查回复上下文，获取之前选择的对话 ID 和名称"""
         if not event.message.is_reply or not event.message.reply_to_msg_id: return None
+        if self._cfg.no_redis: return None # Don't check redis if disabled
         key = f'{self.id}:select_chat:{event.chat_id}:{event.message.reply_to_msg_id}'
         res = self._redis.get(key)
         if res:
@@ -789,6 +859,10 @@ class BotFrontend:
                  return cid, name
             except ValueError: self._redis.delete(key); return None # 无效数据，删除 key
             except EntityNotFoundError: return int(res), f"未知对话 ({res})" # 找到 ID 但无名称
+            # [修改] 捕获 Redis 错误
+            except (RedisResponseError, RedisConnectionError) as e:
+                 logger.error(f"Redis error getting selected chat context: {e}")
+                 return None # Treat as no context found
             except Exception as e: self._logger.error(f"Error getting selected chat name for key {key}: {e}"); return None
         return None # 没有找到对应的 key
 
@@ -805,7 +879,7 @@ class BotFrontend:
             except Exception as e: self._logger.error(f'Failed to get admin input entity for {self._admin_id}: {e}')
         else: self._logger.warning("Admin ID invalid or not configured, skipping admin-specific command registration.")
 
-        # 定义命令列表 (包含 /usage)
+        # 定义命令列表
         admin_commands = [ BotCommand(c, d) for c, d in [
             ("download_chat", '[选项] [对话...] 下载历史'),
             ("monitor_chat", '对话... 添加实时监控'),
@@ -813,7 +887,7 @@ class BotFrontend:
             ("stat", '查询后端状态'),
             ("find_chat_id", '关键词 查找对话ID'),
             ("refresh_chat_names", '刷新对话名称缓存'),
-            ("usage", '查看使用统计') # [新增] usage 命令
+            ("usage", '查看使用统计')
         ]]
         common_commands = [ BotCommand(c, d) for c, d in [
             ("s", '关键词 搜索 (或 /search /ss)'),
@@ -836,8 +910,13 @@ class BotFrontend:
             self._logger.error(f"Setting default commands failed: {e}")
 
 
+    # [新增] 辅助函数：剥离 HTML 标签
+    def _strip_html(self, text: str) -> str:
+        """简单的 HTML 标签剥离器"""
+        return re.sub('<[^>]*>', '', text)
+
     async def _render_response_text(self, result: SearchResult, used_time: float) -> str:
-        """[最终修正] 将搜索结果渲染为发送给用户的 HTML 文本 (链接优化)"""
+        """将搜索结果渲染为发送给用户的 HTML 文本 (优化版)"""
         if not isinstance(result, SearchResult) or not result.hits:
              return "没有找到相关的消息。"
 
@@ -854,37 +933,43 @@ class BotFrontend:
 
                 # 构建消息头
                 hdr = [f"<b>{i}. {html.escape(title)}</b>"]
-                if msg.sender: hdr.append(f"(<u>{html.escape(msg.sender)}</u>)")
+                # [修改] 移除 sender name
+                # if msg.sender: hdr.append(f"(<u>{html.escape(msg.sender)}</u>)") # 移除
                 if isinstance(msg.post_time, datetime): hdr.append(f'[{msg.post_time.strftime("%y-%m-%d %H:%M")}]')
                 else: hdr.append('[无效时间]')
                 sb.append(' '.join(hdr) + '\n')
 
                 # --- 优化链接和文本显示 ---
                 link_added = False
-                # 1. 处理文件名和链接 (文件名作为链接)
+                # 1. 文件名链接优先
                 if msg.filename and msg.url:
                     sb.append(f'<a href="{html.escape(msg.url)}">📎 {html.escape(msg.filename)}</a>\n')
                     link_added = True
-                elif msg.filename: # 容错：只有文件名无 URL
+                elif msg.filename: # 只有文件名
                      sb.append(f"📎 {html.escape(msg.filename)}\n")
 
-                # 2. 处理高亮或后备文本
-                # [修改] 直接使用 hit.highlighted (包含<b>标签和上下文)
-                display_text = hit.highlighted # This now contains HTML with <b> tags and context
-                if not display_text: # 无高亮或无文本时的后备逻辑
-                     if msg.content: display_text = html.escape(brief_content(msg.content, 150)) # Fallback for empty highlight
-                     # If no content and no filename link, add placeholder
-                     elif not link_added and not msg.filename: display_text = "<i>(空消息)</i>"
-                     # If only filename (no URL), display_text remains empty here, which is fine
+                # 2. 处理高亮或后备文本，并限制长度
+                display_text = ""
+                if hit.highlighted:
+                    # 检查高亮文本的纯文本长度
+                    plain_highlighted = self._strip_html(hit.highlighted)
+                    if len(plain_highlighted) <= self.MAX_TEXT_DISPLAY_LENGTH:
+                        display_text = hit.highlighted # 长度合格，保留高亮
+                    else:
+                        # 长度超标，移除高亮，截断纯文本
+                        display_text = html.escape(brief_content(plain_highlighted, self.MAX_TEXT_DISPLAY_LENGTH))
+                elif msg.content: # 没有高亮，但有原文
+                    display_text = html.escape(brief_content(msg.content, self.MAX_TEXT_DISPLAY_LENGTH))
+                # [修改] 不再添加 (空消息) 占位符
+                # else: # 既无高亮也无原文 (可能是仅文件)
+                #     pass # display_text 保持空
 
-                # 3. 如果前面没通过文件名加链接，且 URL 存在，加通用链接
+                # 3. 如果前面没加链接，且 URL 存在，加通用链接
                 if not link_added and msg.url:
-                    # [修改] 在文本之前加通用链接
                     sb.append(f'<a href="{html.escape(msg.url)}">跳转到消息</a>\n')
 
                 # 4. 添加处理后的文本 (如果非空)
                 if display_text:
-                    # [修改] 不需要再 escape，因为它已经是 HTML 了
                     sb.append(f"{display_text}\n")
 
                 sb.append("\n") # 每个结果后加空行
@@ -898,16 +983,15 @@ class BotFrontend:
         final = ''.join(sb); max_len = 4096
         if len(final) > max_len:
              cutoff_msg = "\n\n...(结果过多，仅显示部分)"
-             cutoff_point = max_len - len(cutoff_msg) - 10 # Leave some buffer
-             # Try to cut at a natural break (double newline)
+             cutoff_point = max_len - len(cutoff_msg) - 10
              last_nl = final.rfind('\n\n', 0, cutoff_point)
              if last_nl != -1: final = final[:last_nl] + cutoff_msg
-             else: final = final[:max_len - len(cutoff_msg)] + cutoff_msg # Hard cut if no break found
+             else: final = final[:max_len - len(cutoff_msg)] + cutoff_msg
         return final
 
 
     def _render_respond_buttons(self, result: SearchResult, cur_page_num: int, current_filter: str = "all") -> Optional[List[List[Button]]]:
-        """[最终修正] 生成包含中文筛选和翻页按钮的列表"""
+        """生成包含中文筛选和翻页按钮的列表"""
         if not isinstance(result, SearchResult): return None
         buttons = []
 
@@ -927,7 +1011,6 @@ class BotFrontend:
 
         if total_pages > 1:
             page_buttons = []
-            # [修改] 使用中文按钮文本
             if cur_page_num > 1: page_buttons.append(Button.inline('⬅️ 上一页', f'search_page={cur_page_num - 1}'))
             page_buttons.append(Button.inline(f'{cur_page_num}/{total_pages}', 'noop')) # 页码指示器
             if not result.is_last_page and cur_page_num < total_pages: page_buttons.append(Button.inline('下一页 ➡️', f'search_page={cur_page_num + 1}'))
