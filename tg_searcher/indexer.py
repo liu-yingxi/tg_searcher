@@ -87,7 +87,7 @@ class IndexMsg:
 class SearchHit:
     def __init__(self, msg: IndexMsg, highlighted: str):
         self.msg = msg
-        self.highlighted = highlighted
+        self.highlighted = highlighted # 这个 highlighted 字段现在应该包含 Whoosh 生成的带 <b> 标签的 HTML 片段
 
     def __str__(self):
         return f'SearchHit(highlighted={repr(self.highlighted)}, msg={self.msg})'
@@ -173,9 +173,11 @@ class Indexer:
         self.query_parser.add_plugin(MultifieldPlugin(["content", "filename"]))
 
         # Highlighter 配置 (使用加粗)
+        # [修改] 增加了 maxchars 和 surround 以获得更多上下文
+        # [修改] 增加了 between=' ... ' 在多个高亮片段间添加省略号
         self.highlighter = highlight.Highlighter(
-            fragmenter=highlight.ContextFragmenter(maxchars=150, surround=50),
-            formatter=highlight.HtmlFormatter(tagname="b") # Default is 'strong', using 'b' as requested
+            fragmenter=highlight.ContextFragmenter(maxchars=250, surround=80), # maxchars=片段最大字符数, surround=关键词前后字符数
+            formatter=highlight.HtmlFormatter(tagname="b", between=" ... ") # tagname=高亮标签, between=多片段连接符
         )
 
     def retrieve_random_document(self) -> IndexMsg:
@@ -311,7 +313,7 @@ class Indexer:
                               logger.warning(f"Retrieved non-datetime post_time ({type(post_time)}) for hit {hit.docnum}, using current time.")
                               post_time = datetime.now()
 
-                         # Use IndexMsg 构造函数处理类型和默认值
+                         # 使用 IndexMsg 构造函数处理类型和默认值
                          msg = IndexMsg(
                              content=stored_fields.get('content', ''),
                              url=stored_fields.get('url', ''),
@@ -324,15 +326,18 @@ class Indexer:
                          # 高亮 content
                          highlighted_content = ""
                          if msg.content: # Only highlight if there is content
-                             try:
-                                 highlighted_content = self.highlighter.highlight_hit(hit, 'content', top=1) or ""
-                             except Exception as high_e:
-                                 logger.error(f"Error highlighting hit {hit.docnum} content: {high_e}")
+                            try:
+                                # [修改] 直接调用 highlight_hit 获取片段，让 Highlighter 配置生效
+                                # 它会返回包含 <b> 标签的 HTML 片段
+                                highlighted_content = self.highlighter.highlight_hit(hit, 'content') or ""
+                            except Exception as high_e:
+                                logger.error(f"Error highlighting hit {hit.docnum} content: {high_e}")
                          # 如果无高亮但有内容，取简短原文
                          if not highlighted_content and msg.content:
                               # Use html.escape for safety if brief_content doesn't escape
                               highlighted_content = html.escape(brief_content(msg.content, 150))
 
+                         # 将消息和高亮后的文本存入 SearchHit
                          hits.append(SearchHit(msg, highlighted_content))
                      except Exception as e:
                          logger.error(f"Error processing hit {hit.docnum} (URL: {stored_fields.get('url')}): {e}", exc_info=True)
