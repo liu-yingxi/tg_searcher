@@ -254,6 +254,7 @@ class BackendBot:
 
 
     async def get_index_status(self, length_limit: int = 4000) -> str:
+        """获取后端索引状态的文本描述"""
         cur_len = 0
         sb = []
         try: total_docs = self._indexer.ix.doc_count()
@@ -285,7 +286,7 @@ class BackendBot:
                      msg_for_chat = []
                      num = -1 # 初始化为错误状态
                      try:
-                         # [修正代码] 使用 search + estimated_length 获取数量
+                         # [最终修正] 使用 search + estimated_length 获取数量
                          results = searcher.search(Term('chat_id', str(chat_id)), limit=0)
                          num = results.estimated_length() # 获取匹配查询的文档总数
                      except Exception as e:
@@ -427,3 +428,5 @@ class BackendBot:
                      if deleted_count > 0: self._logger.info(f'Finished deleting {deleted_count} msgs from index for chat {share_id}')
                 except Exception as e: self._logger.error(f"Error processing deletions batch for {share_id}: {e}")
             except Exception as e: self._logger.error(f"Error processing deleted event in chat {event.chat_id}: {e}", exc_info=True)
+
+# --- 文件结束 ---
