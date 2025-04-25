@@ -7,7 +7,7 @@ import telethon.errors.rpcerrorlist
 from telethon import events
 from telethon.tl.patched import Message as TgMessage
 from telethon.tl.types import User
-from whoosh.query import Term # 导入 Term
+from whoosh.query import Term # [修改] 导入 Term 用于 get_index_status
 # --- ADDED IMPORTS ---
 from whoosh import writing
 from whoosh.writing import IndexWriter, LockError
@@ -87,7 +87,8 @@ class BackendBot:
          for chat_id in list(self.monitored_chats): # 迭代副本
               if chat_id in self.excluded_chats: continue
               try:
-                   result = self._indexer.search(q_str='*', in_chats=[chat_id], page_len=1, page_num=1)
+                   # [修改] 确保搜索 * 所有消息，按时间排序取最新
+                   result = self._indexer.search(q_str='*', in_chats=[chat_id], page_len=1, page_num=1, file_filter="all") # Use '*' query
                    if result.hits: self.newest_msg[chat_id] = result.hits[0].msg; count += 1
               except Exception as e: self._logger.warning(f"Failed to load newest message for chat {chat_id}: {e}")
          self._logger.info(f"Finished loading newest messages for {count} chats.")
@@ -182,6 +183,12 @@ class BackendBot:
                 sender = await self._get_sender_name(tg_message)
                 post_time = tg_message.date
 
+                # [修改] 确保 post_time 是 datetime 对象 (iter_messages 通常返回 datetime)
+                if not isinstance(post_time, datetime):
+                    self._logger.warning(f"Non-datetime post_time ({type(post_time)}) from iter_messages for {url}, using current time.")
+                    post_time = datetime.now()
+
+
                 msg_text, filename = '', None
                 if tg_message.file and hasattr(tg_message.file, 'name') and tg_message.file.name:
                     filename = tg_message.file.name
@@ -196,6 +203,9 @@ class BackendBot:
                 if call_back and processed_count % 100 == 0:
                      try: await call_back(tg_message.id, downloaded_count)
                      except Exception as cb_e: self._logger.warning(f"Error in download callback: {cb_e}")
+                # [新增] 避免长时间运行阻塞事件循环
+                if processed_count % 500 == 0: await asyncio.sleep(0.01)
+
 
         except telethon.errors.rpcerrorlist.ChannelPrivateError as e:
              self._logger.error(f"Permission denied for chat {share_id}. Is session member? Error: {e}"); self.monitored_chats.discard(share_id); raise EntityNotFoundError(f"无法访问对话 {chat_id}，请确保后端账号是其成员。") from e
@@ -214,10 +224,12 @@ class BackendBot:
         indexed_count_in_batch: int = 0
         try:
             writer = self._indexer.ix.writer()
-            for msg in msg_list:
+            for i, msg in enumerate(msg_list):
                 try:
                     self._indexer.add_document(msg, writer); indexed_count_in_batch += 1
                     if newest_msg_in_batch is None or msg.post_time > newest_msg_in_batch.post_time: newest_msg_in_batch = msg
+                    # [新增] 批量写入时也避免阻塞
+                    if i % 1000 == 0: await asyncio.sleep(0.01)
                 except Exception as add_e: self._logger.error(f"Error adding document {msg.url} to batch writer: {add_e}")
             writer.commit()
             self._logger.info(f'Write index commit ok for {indexed_count_in_batch} messages from chat {share_id}')
@@ -264,7 +276,7 @@ class BackendBot:
         overflow_msg = f'\n\n(部分信息因长度限制未显示)'
         def append_msg(msg_list: List[str]) -> bool:
             nonlocal cur_len; new_len = sum(len(msg) for msg in msg_list)
-            if cur_len + new_len > length_limit - len(overflow_msg) - 50: return True
+            if cur_len + new_len > length_limit - len(overflow_msg) - 50: return True # Add margin
             cur_len += new_len; sb.extend(msg_list); return False
 
         if self.excluded_chats:
@@ -281,14 +293,17 @@ class BackendBot:
         if append_msg([f'总计 {len(monitored_chats_list)} 个对话被加入了索引:\n']): sb.append(overflow_msg); return ''.join(sb)
 
         try:
+             # [修改] 使用 searcher 获取每个 chat 的文档数
              with self._indexer.ix.searcher() as searcher:
                  for chat_id in monitored_chats_list:
                      msg_for_chat = []
                      num = -1 # 初始化为错误状态
                      try:
-                         # [最终修正] 使用 search + estimated_length 获取数量
+                         # 使用 Term 查询特定 chat_id，limit=0 不返回实际结果，只用于计数
                          results = searcher.search(Term('chat_id', str(chat_id)), limit=0)
+                         # estimated_length() 或 doc_count(query) 是获取总数的正确方法
                          num = results.estimated_length() # 获取匹配查询的文档总数
+                         # 或者: num = searcher.doc_count(query=Term('chat_id', str(chat_id)))
                      except Exception as e:
                          # 如果搜索或获取数量失败，记录错误，num 保持 -1
                          self._logger.error(f"Error counting documents for chat {chat_id}: {e}", exc_info=True) # 添加 exc_info
@@ -297,7 +312,7 @@ class BackendBot:
                      except EntityNotFoundError: chat_html = f"未知对话 (`{chat_id}`)"
                      except Exception: chat_html = f"对话 `{chat_id}` (获取名称出错)"
 
-                     # 使用 "[计数失败]" 作为更明确的错误提示
+                     # [修改] 使用 "[计数失败]" 作为更明确的错误提示
                      msg_for_chat.append(f'- {chat_html} 共 {"[计数失败]" if num < 0 else num} 条消息\n')
 
                      if newest_msg := self.newest_msg.get(chat_id):
@@ -307,8 +322,11 @@ class BackendBot:
                          msg_for_chat.append(f'  最新: <a href="{newest_msg.url}">{esc_display}</a> (@{newest_msg.post_time.strftime("%y-%m-%d %H:%M")})\n')
 
                      if append_msg(msg_for_chat): sb.append(overflow_msg); break
+        except writing.LockError:
+            self._logger.error(f"Index locked, failed to open searcher for status.")
+            append_msg(["\n错误：索引被锁定，无法获取详细状态。\n"])
         except Exception as e:
-             self._logger.error(f"Failed open searcher for status: {e}")
+             self._logger.error(f"Failed open searcher or process chats for status: {e}", exc_info=True)
              append_msg(["\n错误：无法获取详细状态。\n"])
 
         return ''.join(sb)
@@ -348,19 +366,26 @@ class BackendBot:
         try:
             sender = await message.get_sender()
             if isinstance(sender, User): return format_entity_name(sender)
-            else: return getattr(sender, 'title', '')
+            else: return getattr(sender, 'title', '') # Handle channels/chats posting as themselves
         except Exception: return ''
 
 
     def _register_hooks(self):
         @self.session.on(events.NewMessage())
         async def client_message_handler(event: events.NewMessage.Event):
-            if event.chat_id is None or not self._should_monitor(event.chat_id): return
+            if not hasattr(event, 'chat_id') or event.chat_id is None or not self._should_monitor(event.chat_id): return # Add hasattr check
             try:
                 share_id = get_share_id(event.chat_id)
                 url = f'https://t.me/c/{share_id}/{event.id}'
                 sender = await self._get_sender_name(event.message)
                 post_time = event.message.date
+
+                # [修改] 确保 post_time 是 datetime
+                if not isinstance(post_time, datetime):
+                    self._logger.warning(f"Non-datetime post_time ({type(post_time)}) from NewMessage event for {url}, using current time.")
+                    post_time = datetime.now()
+
+
                 msg_text, filename = '', None
                 if event.message.file and hasattr(event.message.file, 'name') and event.message.file.name:
                     filename = event.message.file.name
@@ -368,9 +393,10 @@ class BackendBot:
                     self._logger.info(f'New file {url} from "{sender}": "{filename}" Cap:"{brief_content(msg_text)}"')
                 elif event.message.text:
                     msg_text = escape_content(event.message.text.strip())
-                    if not msg_text.strip() and not filename: return
+                    # [修改] 仅当有文本或文件名时才继续
+                    if not msg_text.strip(): return # Ignore messages with only whitespace
                     self._logger.info(f'New msg {url} from "{sender}": "{brief_content(msg_text)}"')
-                else: return
+                else: return # Ignore messages with neither text nor file
 
                 msg = IndexMsg(content=msg_text or "", url=url, chat_id=share_id, post_time=post_time, sender=sender or "", filename=filename)
                 if share_id not in self.newest_msg or msg.post_time > self.newest_msg[share_id].post_time: self.newest_msg[share_id] = msg; self._logger.debug(f"Updated newest cache for {share_id} to {url}")
@@ -380,36 +406,58 @@ class BackendBot:
 
         @self.session.on(events.MessageEdited())
         async def client_message_update_handler(event: events.MessageEdited.Event):
-            if event.chat_id is None or not self._should_monitor(event.chat_id): return
+            if not hasattr(event, 'chat_id') or event.chat_id is None or not self._should_monitor(event.chat_id): return
             try:
                 share_id = get_share_id(event.chat_id)
                 url = f'https://t.me/c/{share_id}/{event.id}'
                 new_msg_text = escape_content(event.message.text.strip()) if event.message.text else ''
-                self._logger.info(f'Msg {url} edited. New content: "{brief_content(new_msg_text)}"')
+                # [修改] 仅当文本实际改变或消息不在索引中时处理
+                self._logger.info(f'Msg {url} edited. Checking for update...')
                 try:
                     old_fields = self._indexer.get_document_fields(url=url)
                     if old_fields:
+                        # Check if only content changed and if it's different
+                        if old_fields.get('content') == new_msg_text:
+                             self._logger.debug(f"Edit event for {url} has same content, skipping index update.")
+                             return
+
                         new_fields = old_fields.copy(); new_fields['content'] = new_msg_text or ""
+                        # Ensure other essential fields exist, fallback if needed
                         new_fields.setdefault('chat_id', str(share_id))
-                        new_fields.setdefault('post_time', event.message.date)
-                        new_fields.setdefault('sender', old_fields.get('sender', ''))
+                        new_fields.setdefault('post_time', old_fields.get('post_time', event.message.date or datetime.now())) # Prefer original time
+                        new_fields.setdefault('sender', old_fields.get('sender', await self._get_sender_name(event.message) or ''))
                         new_fields.setdefault('filename', old_fields.get('filename', None))
                         new_fields.setdefault('url', url)
+                        # Re-derive has_file based on filename
+                        new_fields['has_file'] = 1 if new_fields.get('filename') else 0
+
                         self._indexer.replace_document(url=url, new_fields=new_fields)
                         self._logger.info(f'Updated msg content in index for {url}')
-                        if share_id in self.newest_msg and self.newest_msg[share_id].url == url: self.newest_msg[share_id].content = new_msg_text; self._logger.debug(f"Updated newest cache content for {url}")
+                        # Update newest cache if this was the newest message
+                        if share_id in self.newest_msg and self.newest_msg[share_id].url == url:
+                             # Reconstruct IndexMsg to ensure consistency
+                             try: self.newest_msg[share_id] = IndexMsg(**new_fields); self._logger.debug(f"Updated newest cache content for {url}")
+                             except Exception as cache_e: self._logger.error(f"Error reconstructing IndexMsg for cache update {url}: {cache_e}")
                     else:
+                         # Edited message not in index, add it as a new one
                          self._logger.warning(f'Edited msg {url} not found in index. Adding as new message.')
                          sender = await self._get_sender_name(event.message)
-                         post_time = event.message.date
-                         filename = None # Assume file doesn't change on edit text
+                         post_time = event.message.date or datetime.now() # Use edit time or now
+                         filename = None # Assume file doesn't change on edit text? Need confirmation.
+                         # [修改] 确保 post_time 是 datetime
+                         if not isinstance(post_time, datetime): post_time = datetime.now()
+
                          msg = IndexMsg(content=new_msg_text or "", url=url, chat_id=share_id, post_time=post_time, sender=sender or "", filename=filename)
                          self._indexer.add_document(msg)
-                except Exception as e: self._logger.error(f'Error updating edited msg {url} in index: {e}')
+                         # Update newest cache if this new message is the newest
+                         if share_id not in self.newest_msg or msg.post_time > self.newest_msg[share_id].post_time: self.newest_msg[share_id] = msg; self._logger.debug(f"Added edited msg {url} as newest cache for {share_id}")
+
+                except Exception as e: self._logger.error(f'Error updating edited msg {url} in index: {e}', exc_info=True) # Add exc_info
             except Exception as e: self._logger.error(f"Error processing edited message in chat {event.chat_id}: {e}", exc_info=True)
 
         @self.session.on(events.MessageDeleted())
         async def client_message_delete_handler(event: events.MessageDeleted.Event):
+            # [修改] Handle cases where chat_id might be None (e.g., deleted from Saved Messages?)
             if not hasattr(event, 'chat_id') or event.chat_id is None or not self._should_monitor(event.chat_id):
                  self._logger.debug(f"Ignoring deletion event without valid/monitored chat_id. Deleted IDs: {event.deleted_ids}")
                  return
@@ -420,7 +468,11 @@ class BackendBot:
                 try:
                      with self._indexer.ix.writer() as writer:
                           for url in urls:
-                               if share_id in self.newest_msg and self.newest_msg[share_id].url == url: del self.newest_msg[share_id]; self._logger.info(f"Removed newest cache for {share_id} due to deletion of {url}.")
+                               # Update newest message cache if deleted message was the newest
+                               if share_id in self.newest_msg and self.newest_msg[share_id].url == url:
+                                    del self.newest_msg[share_id]
+                                    self._logger.info(f"Removed newest cache for {share_id} due to deletion of {url}. Will reload on next status check or start.")
+                                    # Optionally, could try to find the *next* newest message immediately, but might be slow.
                                try:
                                     count = writer.delete_by_term('url', url)
                                     if count > 0: deleted_count += count; self._logger.info(f"Deleted msg {url} from index.")
@@ -428,5 +480,4 @@ class BackendBot:
                      if deleted_count > 0: self._logger.info(f'Finished deleting {deleted_count} msgs from index for chat {share_id}')
                 except Exception as e: self._logger.error(f"Error processing deletions batch for {share_id}: {e}")
             except Exception as e: self._logger.error(f"Error processing deleted event in chat {event.chat_id}: {e}", exc_info=True)
-
 # --- 文件结束 ---
