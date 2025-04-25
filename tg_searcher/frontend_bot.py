@@ -108,23 +108,26 @@ class FakeRedis:
     def ping(self): return True # 总是认为连接正常
     def sadd(self, key, *values):
         """模拟 SADD"""
+        # [修改] 确保 key 存在且为 set，处理过期
         current_set, expiry = self._data.get(key, (set(), None))
         if not isinstance(current_set, set): current_set = set()
-        if expiry is not None and expiry <= time(): current_set = set(); expiry = None
+        if expiry is not None and expiry <= time(): current_set = set(); expiry = None # 过期则清空
         added_count = 0
-        str_values = {str(v) for v in values}
+        str_values = {str(v) for v in values} # 确保值是字符串
         for v in str_values:
             if v not in current_set: current_set.add(v); added_count += 1
-        self._data[key] = (current_set, expiry)
+        self._data[key] = (current_set, expiry) # 重新设置值和过期时间（如果未过期）
         return added_count
     def scard(self, key):
         """模拟 SCARD"""
+        # [修改] 处理过期
         v = self._data.get(key)
         if v and isinstance(v[0], set) and (v[1] is None or v[1] > time()): return len(v[0])
-        elif v and v[1] is not None and v[1] <= time(): del self._data[key]
+        elif v and v[1] is not None and v[1] <= time(): del self._data[key] # 过期删除
         return 0
     def expire(self, key, seconds):
         """模拟 EXPIRE"""
+        # [修改] 确保 key 存在
         if key in self._data:
             value, _ = self._data[key]
             self._data[key] = (value, time() + seconds)
@@ -196,7 +199,7 @@ class BotFrontend:
         self.username: Optional[str] = None # Bot 的用户名
         self.my_id: Optional[int] = None # Bot 自身的 User ID
 
-        # Redis Keys for stats
+        # [新增] Redis Keys for stats
         self._TOTAL_USERS_KEY = f'{self.id}:total_users'
         self._ACTIVE_USERS_KEY = f'{self.id}:active_users_15m'
         self._ACTIVE_USER_TTL = 900 # 15 minutes in seconds
@@ -265,6 +268,7 @@ class BotFrontend:
             # 向管理员发送启动成功消息和初始状态
             if self._admin_id:
                  try:
+                     # [修改] 调整获取状态的长度限制
                      status_msg = await self.backend.get_index_status(4000 - 100) # 留出更多余地
                      msg = f'✅ Bot frontend init complete ({self.id})\n\n{status_msg}'
                      await self.bot.send_message(self._admin_id, msg, parse_mode='html', link_preview=False)
@@ -279,16 +283,19 @@ class BotFrontend:
             # Consider raising the exception or exiting if start fails critically
             # raise e
 
+    # [新增] 用户活动追踪
     def _track_user_activity(self, user_id: Optional[int]):
         """使用 Redis Set 记录用户活动，用于统计。"""
         if not user_id or user_id == self._admin_id or user_id == self.my_id or self._cfg.no_redis: return
         try:
             user_id_str = str(user_id)
             if isinstance(self._redis, FakeRedis):
+                # FakeRedis 不支持 pipeline，单独调用
                 self._redis.sadd(self._TOTAL_USERS_KEY, user_id_str)
                 self._redis.sadd(self._ACTIVE_USERS_KEY, user_id_str)
                 self._redis.expire(self._ACTIVE_USERS_KEY, self._ACTIVE_USER_TTL)
             else:
+                # 使用 pipeline 提高效率
                 pipe = self._redis.pipeline()
                 pipe.sadd(self._TOTAL_USERS_KEY, user_id_str)
                 pipe.sadd(self._ACTIVE_USERS_KEY, user_id_str)
@@ -300,7 +307,7 @@ class BotFrontend:
         """处理按钮回调"""
         try:
             self._logger.info(f'Callback: {event.sender_id} in {event.chat_id}, msg={event.message_id}, data={event.data!r}')
-            self._track_user_activity(event.sender_id) # 记录活动
+            self._track_user_activity(event.sender_id) # [新增] 记录活动
 
             if not event.data: await event.answer("无效操作。"); return
             try: query_data = event.data.decode('utf-8')
@@ -345,6 +352,7 @@ class BotFrontend:
 
                  # 重新渲染消息
                  response = await self._render_response_text(result, time() - start_time)
+                 # [修改] 传递 new_filter
                  buttons = self._render_respond_buttons(result, new_page_num, current_filter=new_filter)
                  try: await event.edit(response, parse_mode='html', buttons=buttons, link_preview=False); await event.answer()
                  except rpcerrorlist.MessageNotModifiedError: await event.answer() # 消息未改变也需 answer
@@ -384,7 +392,7 @@ class BotFrontend:
         text: str = event.raw_text.strip()
         sender_id = event.sender_id
         self._logger.info(f'User {sender_id} chat {event.chat_id}: "{brief_content(text, 100)}"')
-        self._track_user_activity(sender_id) # 记录活动
+        self._track_user_activity(sender_id) # [新增] 记录活动
         selected_chat_context = await self._get_selected_chat_from_reply(event)
 
         if not text or text.startswith('/start'):
@@ -477,7 +485,7 @@ class BotFrontend:
         selected_chat_context = await self._get_selected_chat_from_reply(event)
         selected_chat_id = selected_chat_context[0] if selected_chat_context else None
         selected_chat_name = selected_chat_context[1] if selected_chat_context else None
-        self._track_user_activity(event.sender_id) # 记录管理员活动
+        self._track_user_activity(event.sender_id) # [新增] 记录管理员活动
 
         # --- 管理员命令处理 ---
         if text.startswith('/help'):
@@ -564,8 +572,8 @@ class BotFrontend:
                  else: sb.append(f'未找到与 "{html.escape(q)}" 匹配的对话。')
                  await event.reply(''.join(sb), parse_mode='html')
              except Exception as e: self._logger.error(f"Find chat ID error: {e}", exc_info=True); await event.reply(f"查找对话 ID 时出错: {e}")
+        # [修改] /refresh_chat_names 添加反馈
         elif text.startswith('/refresh_chat_names'):
-            # [优化] 改进刷新反馈
             msg: Optional[TgMessage] = None
             try:
                 msg = await event.reply('⏳ 正在刷新对话名称缓存，这可能需要一些时间...')
@@ -578,14 +586,22 @@ class BotFrontend:
                     try: await msg.edit(error_text)
                     except Exception: await event.reply(error_text) # 编辑失败则发送新消息
                 else: await event.reply(error_text) # 初始消息发送失败
+        # [新增] /usage 命令处理
         elif text.startswith('/usage'):
              if self._cfg.no_redis: await event.reply("使用统计功能需要 Redis (当前已禁用)。"); return
              try:
                  total_count = 0; active_count = 0
-                 if isinstance(self._redis, FakeRedis): total_count = self._redis.scard(self._TOTAL_USERS_KEY); active_count = self._redis.scard(self._ACTIVE_USERS_KEY)
+                 if isinstance(self._redis, FakeRedis):
+                     # FakeRedis 不支持 pipeline
+                     total_count = self._redis.scard(self._TOTAL_USERS_KEY)
+                     active_count = self._redis.scard(self._ACTIVE_USERS_KEY)
                  else:
-                     pipe = self._redis.pipeline(); pipe.scard(self._TOTAL_USERS_KEY); pipe.scard(self._ACTIVE_USERS_KEY); results = pipe.execute()
-                     total_count = results[0] if results and len(results) > 0 else 0; active_count = results[1] if results and len(results) > 1 else 0
+                     pipe = self._redis.pipeline()
+                     pipe.scard(self._TOTAL_USERS_KEY)
+                     pipe.scard(self._ACTIVE_USERS_KEY)
+                     results = pipe.execute()
+                     total_count = results[0] if results and len(results) > 0 else 0
+                     active_count = results[1] if results and len(results) > 1 else 0
                  await event.reply(f"📊 **使用统计**\n- 总独立用户数: {total_count}\n- 活跃用户数 (最近15分钟): {active_count}", parse_mode='markdown')
              except Exception as e: self._logger.error(f"Failed to get usage stats: {e}", exc_info=True); await event.reply(f"获取使用统计时出错: {html.escape(str(e))}")
         else:
@@ -622,6 +638,7 @@ class BotFrontend:
             result = self.backend.search(query, target_chats, self._cfg.page_len, 1, file_filter="all")
             # 渲染结果
             text = await self._render_response_text(result, time() - start)
+            # [修改] 传递初始 filter
             buttons = self._render_respond_buttons(result, 1, current_filter="all")
             # 发送回复
             msg = await event.reply(text, parse_mode='html', buttons=buttons, link_preview=False)
@@ -653,7 +670,7 @@ class BotFrontend:
         prog_msg: Optional[TgMessage] = None
         last_update = time(); interval = 5; count = 0
 
-        # [修正] 进度回调函数，确保文本是中文
+        # [修改] 进度回调函数，确保文本是中文
         async def cb(cur_id: int, dl_count: int):
             nonlocal prog_msg, last_update, count; count = dl_count; now = time()
             if now - last_update > interval: # 控制更新频率
@@ -663,7 +680,7 @@ class BotFrontend:
                 try:
                     if prog_msg is None: prog_msg = await event.reply(txt, parse_mode='html')
                     else: await prog_msg.edit(txt, parse_mode='html')
-                except rpcerrorlist.FloodWaitError as fwe: self._logger.warning(f"Flood wait ({fwe.seconds}s) during progress update for {chat_id}."); last_update += fwe.seconds
+                except rpcerrorlist.FloodWaitError as fwe: self._logger.warning(f"Flood wait ({fwe.seconds}s) during progress update for {chat_id}."); last_update += fwe.seconds # 延后下次更新
                 except rpcerrorlist.MessageNotModifiedError: pass
                 except rpcerrorlist.MessageIdInvalidError: prog_msg = None # 进度消息被删
                 except Exception as e: self._logger.error(f"Edit progress message error {chat_id}: {e}"); prog_msg = None
@@ -673,16 +690,24 @@ class BotFrontend:
             # 调用后端下载
             await self.backend.download_history(chat_id, min_id, max_id, cb)
             msg = f'✅ {chat_html} 下载完成，索引了 {count} 条消息，耗时 {time()-start:.2f} 秒。'
-            try: await event.reply(msg, parse_mode='html')
-            except Exception: await self.bot.send_message(event.chat_id, msg, parse_mode='html') # 回复失败则发送
+            try:
+                # [修改] 如果有进度消息，编辑它；否则发送新消息
+                if prog_msg: await prog_msg.edit(msg, parse_mode='html')
+                else: await event.reply(msg, parse_mode='html')
+                prog_msg = None # 防止 finally 再次删除
+            except Exception: await self.bot.send_message(event.chat_id, msg, parse_mode='html') # 编辑/回复失败则发送
         except (EntityNotFoundError, ValueError) as e: # 捕获预期错误
             self._logger.error(f"Download failed for {chat_id}: {e}")
-            await event.reply(f'❌ 下载 {chat_html} 时出错: {e}', parse_mode='html')
+            error_msg = f'❌ 下载 {chat_html} 时出错: {e}'
+            if prog_msg: await prog_msg.edit(error_msg, parse_mode='html'); prog_msg = None
+            else: await event.reply(error_msg, parse_mode='html')
         except Exception as e: # 捕获其他错误
             self._logger.error(f"Unknown download error for {chat_id}: {e}", exc_info=True)
-            await event.reply(f'❌ 下载 {chat_html} 时发生未知错误: {type(e).__name__}', parse_mode='html')
+            error_msg = f'❌ 下载 {chat_html} 时发生未知错误: {type(e).__name__}'
+            if prog_msg: await prog_msg.edit(error_msg, parse_mode='html'); prog_msg = None
+            else: await event.reply(error_msg, parse_mode='html')
         finally:
-            # 尝试删除进度消息
+            # 尝试删除最终未被编辑的进度消息
             if prog_msg:
                 try: await prog_msg.delete()
                 except Exception: pass
@@ -780,7 +805,7 @@ class BotFrontend:
             except Exception as e: self._logger.error(f'Failed to get admin input entity for {self._admin_id}: {e}')
         else: self._logger.warning("Admin ID invalid or not configured, skipping admin-specific command registration.")
 
-        # 定义命令列表
+        # 定义命令列表 (包含 /usage)
         admin_commands = [ BotCommand(c, d) for c, d in [
             ("download_chat", '[选项] [对话...] 下载历史'),
             ("monitor_chat", '对话... 添加实时监控'),
@@ -788,7 +813,7 @@ class BotFrontend:
             ("stat", '查询后端状态'),
             ("find_chat_id", '关键词 查找对话ID'),
             ("refresh_chat_names", '刷新对话名称缓存'),
-            ("usage", '查看使用统计')
+            ("usage", '查看使用统计') # [新增] usage 命令
         ]]
         common_commands = [ BotCommand(c, d) for c, d in [
             ("s", '关键词 搜索 (或 /search /ss)'),
@@ -844,19 +869,22 @@ class BotFrontend:
                      sb.append(f"📎 {html.escape(msg.filename)}\n")
 
                 # 2. 处理高亮或后备文本
-                display_text = hit.highlighted # 直接使用包含 <b> 的 HTML
-                if not display_text: # 无高亮时的后备逻辑
-                     if msg.content: display_text = html.escape(brief_content(msg.content, 150))
-                     # 不再需要 "(File, no text content)"
-                     # elif msg.filename: display_text = ""
-                     else: display_text = "<i>(空消息)</i>"
+                # [修改] 直接使用 hit.highlighted (包含<b>标签和上下文)
+                display_text = hit.highlighted # This now contains HTML with <b> tags and context
+                if not display_text: # 无高亮或无文本时的后备逻辑
+                     if msg.content: display_text = html.escape(brief_content(msg.content, 150)) # Fallback for empty highlight
+                     # If no content and no filename link, add placeholder
+                     elif not link_added and not msg.filename: display_text = "<i>(空消息)</i>"
+                     # If only filename (no URL), display_text remains empty here, which is fine
 
                 # 3. 如果前面没通过文件名加链接，且 URL 存在，加通用链接
                 if not link_added and msg.url:
+                    # [修改] 在文本之前加通用链接
                     sb.append(f'<a href="{html.escape(msg.url)}">跳转到消息</a>\n')
 
                 # 4. 添加处理后的文本 (如果非空)
                 if display_text:
+                    # [修改] 不需要再 escape，因为它已经是 HTML 了
                     sb.append(f"{display_text}\n")
 
                 sb.append("\n") # 每个结果后加空行
@@ -870,10 +898,11 @@ class BotFrontend:
         final = ''.join(sb); max_len = 4096
         if len(final) > max_len:
              cutoff_msg = "\n\n...(结果过多，仅显示部分)"
-             cutoff_point = max_len - len(cutoff_msg) - 10
+             cutoff_point = max_len - len(cutoff_msg) - 10 # Leave some buffer
+             # Try to cut at a natural break (double newline)
              last_nl = final.rfind('\n\n', 0, cutoff_point)
              if last_nl != -1: final = final[:last_nl] + cutoff_msg
-             else: final = final[:max_len - len(cutoff_msg)] + cutoff_msg
+             else: final = final[:max_len - len(cutoff_msg)] + cutoff_msg # Hard cut if no break found
         return final
 
 
@@ -898,11 +927,10 @@ class BotFrontend:
 
         if total_pages > 1:
             page_buttons = []
+            # [修改] 使用中文按钮文本
             if cur_page_num > 1: page_buttons.append(Button.inline('⬅️ 上一页', f'search_page={cur_page_num - 1}'))
             page_buttons.append(Button.inline(f'{cur_page_num}/{total_pages}', 'noop')) # 页码指示器
             if not result.is_last_page and cur_page_num < total_pages: page_buttons.append(Button.inline('下一页 ➡️', f'search_page={cur_page_num + 1}'))
             if page_buttons: buttons.append(page_buttons)
 
         return buttons if buttons else None
-
-# --- 文件结束 ---
