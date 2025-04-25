@@ -400,17 +400,20 @@ class BotFrontend:
                 respond = f'随机消息来自 **{html.escape(chat_name)}** (`{msg.chat_id}`)\n'
                 if msg.sender: respond += f'发送者: {html.escape(msg.sender)}\n'
                 respond += f'时间: {msg.post_time.strftime("%Y-%m-%d %H:%M")}\n'
-                # --- 应用链接优化逻辑 ---
+                # --- 应用链接优化逻辑 (同样适用于 /random) ---
                 link_added = False
-                if msg.filename:
+                if msg.filename and msg.url:
                     respond += f'<a href="{html.escape(msg.url)}">📎 {html.escape(msg.filename)}</a>\n'
                     link_added = True
+                elif msg.filename: # 只有文件名
+                    respond += f"📎 {html.escape(msg.filename)}\n"
+                # 处理文本内容
                 if msg.content:
-                    content_display = html.escape(brief_content(msg.content))
-                    if not link_added and msg.url:
+                    content_display = html.escape(brief_content(msg.content)) # 使用 brief_content
+                    if not link_added and msg.url: # 如果前面没加链接，这里加
                         respond += f'<a href="{html.escape(msg.url)}">跳转到消息</a>\n'
                     respond += f'{content_display}\n'
-                elif not link_added and msg.url: # 如果只有文件或完全为空，也确保有链接
+                elif not link_added and msg.url: # 既无文件也无文本，确保有链接
                     respond += f'<a href="{html.escape(msg.url)}">跳转到消息</a>\n<i>(空消息)</i>\n'
                 # --- 结束链接优化 ---
             except IndexError: respond = '错误：索引库为空。'
@@ -425,6 +428,7 @@ class BotFrontend:
                 for cid in monitored:
                     try:
                          name = await self.backend.translate_chat_id(cid)
+                         # 关键词匹配名称或 ID
                          if kw and kw.lower() not in name.lower() and str(cid) != kw: continue
                          found += 1
                          if found <= 50: buttons.append(Button.inline(f"{brief_content(name, 25)} (`{cid}`)", f'select_chat={cid}'))
@@ -560,26 +564,20 @@ class BotFrontend:
                  else: sb.append(f'未找到与 "{html.escape(q)}" 匹配的对话。')
                  await event.reply(''.join(sb), parse_mode='html')
              except Exception as e: self._logger.error(f"Find chat ID error: {e}", exc_info=True); await event.reply(f"查找对话 ID 时出错: {e}")
-        # [修改] 优化 /refresh_chat_names 反馈
         elif text.startswith('/refresh_chat_names'):
-            msg: Optional[TgMessage] = None # 初始化消息变量
+            # [优化] 改进刷新反馈
+            msg: Optional[TgMessage] = None
             try:
-                # 1. 先发送提示消息
                 msg = await event.reply('⏳ 正在刷新对话名称缓存，这可能需要一些时间...')
-                # 2. 执行实际操作 (调用后端)
                 await self.backend.session.refresh_translate_table()
-                # 3. 成功后编辑原消息
                 await msg.edit('✅ 对话名称缓存已刷新。')
             except Exception as e:
                 self._logger.error("Refresh chat names error:", exc_info=True)
                 error_text = f'❌ 刷新缓存时出错: {html.escape(str(e))}'
-                # 4. 失败后尝试编辑原消息
-                if msg: # 确保 msg 已被赋值
+                if msg:
                     try: await msg.edit(error_text)
-                    except Exception: # 编辑失败则发送新消息
-                         await event.reply(error_text)
-                else: # 如果第一步发送消息就失败了，直接回复错误
-                    await event.reply(error_text)
+                    except Exception: await event.reply(error_text) # 编辑失败则发送新消息
+                else: await event.reply(error_text) # 初始消息发送失败
         elif text.startswith('/usage'):
              if self._cfg.no_redis: await event.reply("使用统计功能需要 Redis (当前已禁用)。"); return
              try:
@@ -606,8 +604,6 @@ class BotFrontend:
              await event.reply(f"正在搜索 **{html.escape(selected_chat_name or str(selected_chat_id))}** (`{selected_chat_id}`) 中的所有消息", parse_mode='markdown')
         elif not query: # 全局搜索不能没有关键词
              self._logger.debug("Empty query ignored for global search.")
-             # 可以选择回复提示
-             # await event.reply("请输入关键词进行搜索。")
              return
 
         target_chats = [selected_chat_id] if selected_chat_id is not None else None # 设置搜索目标
@@ -657,11 +653,13 @@ class BotFrontend:
         prog_msg: Optional[TgMessage] = None
         last_update = time(); interval = 5; count = 0
 
-        # 进度回调函数
+        # [修正] 进度回调函数，确保文本是中文
         async def cb(cur_id: int, dl_count: int):
             nonlocal prog_msg, last_update, count; count = dl_count; now = time()
             if now - last_update > interval: # 控制更新频率
-                last_update = now; txt = f'⏳ 正在下载 {chat_html}:\n已处理 {dl_count} 条，当前消息 ID: {cur_id}'
+                last_update = now
+                # 使用中文提示
+                txt = f'⏳ 正在下载 {chat_html}:\n已处理 {dl_count} 条，当前消息 ID: {cur_id}'
                 try:
                     if prog_msg is None: prog_msg = await event.reply(txt, parse_mode='html')
                     else: await prog_msg.edit(txt, parse_mode='html')
@@ -814,7 +812,7 @@ class BotFrontend:
 
 
     async def _render_response_text(self, result: SearchResult, used_time: float) -> str:
-        """将搜索结果渲染为发送给用户的 HTML 文本"""
+        """[最终修正] 将搜索结果渲染为发送给用户的 HTML 文本 (链接优化)"""
         if not isinstance(result, SearchResult) or not result.hits:
              return "没有找到相关的消息。"
 
@@ -838,30 +836,30 @@ class BotFrontend:
 
                 # --- 优化链接和文本显示 ---
                 link_added = False
-                # 1. 处理文件名和链接
+                # 1. 处理文件名和链接 (文件名作为链接)
                 if msg.filename and msg.url:
-                    # 文件名作为链接
                     sb.append(f'<a href="{html.escape(msg.url)}">📎 {html.escape(msg.filename)}</a>\n')
                     link_added = True
-                elif msg.filename: # 只有文件名没有 URL (理论上不应发生)
+                elif msg.filename: # 容错：只有文件名无 URL
                      sb.append(f"📎 {html.escape(msg.filename)}\n")
 
                 # 2. 处理高亮或后备文本
-                display_text = hit.highlighted # 直接使用 Whoosh 生成的带 <b> 的 HTML 片段
-                if not display_text: # 如果没有高亮内容
+                display_text = hit.highlighted # 直接使用包含 <b> 的 HTML
+                if not display_text: # 无高亮时的后备逻辑
                      if msg.content: display_text = html.escape(brief_content(msg.content, 150))
-                     elif msg.filename: display_text = "" # 如果只有文件，不显示 (File, no text content)
+                     # 不再需要 "(File, no text content)"
+                     # elif msg.filename: display_text = ""
                      else: display_text = "<i>(空消息)</i>"
 
-                # 3. 如果前面没有添加链接，并且 URL 存在，则添加通用跳转链接
+                # 3. 如果前面没通过文件名加链接，且 URL 存在，加通用链接
                 if not link_added and msg.url:
                     sb.append(f'<a href="{html.escape(msg.url)}">跳转到消息</a>\n')
 
-                # 4. 添加处理后的文本 (如果 display_text 非空)
+                # 4. 添加处理后的文本 (如果非空)
                 if display_text:
                     sb.append(f"{display_text}\n")
 
-                sb.append("\n") # 在每个结果后添加一个空行
+                sb.append("\n") # 每个结果后加空行
                 # --- 结束优化 ---
 
             except Exception as e:
@@ -880,7 +878,7 @@ class BotFrontend:
 
 
     def _render_respond_buttons(self, result: SearchResult, cur_page_num: int, current_filter: str = "all") -> Optional[List[List[Button]]]:
-        """生成包含中文筛选和翻页按钮的列表"""
+        """[最终修正] 生成包含中文筛选和翻页按钮的列表"""
         if not isinstance(result, SearchResult): return None
         buttons = []
 
