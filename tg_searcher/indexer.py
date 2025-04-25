@@ -87,7 +87,8 @@ class IndexMsg:
 class SearchHit:
     def __init__(self, msg: IndexMsg, highlighted: str):
         self.msg = msg
-        self.highlighted = highlighted # 这个 highlighted 字段现在应该包含 Whoosh 生成的带 <b> 标签的 HTML 片段
+        # [修改] highlighted 包含带 <b> 标签的 HTML 片段 (上下文)
+        self.highlighted = highlighted
 
     def __str__(self):
         return f'SearchHit(highlighted={repr(self.highlighted)}, msg={self.msg})'
@@ -159,25 +160,31 @@ class Indexer:
             expected_fields = sorted(IndexMsg.schema.names())
             actual_fields = sorted(self.ix.schema.names())
             if expected_fields != actual_fields:
-                 raise ValueError(
-                    f"Incompatible schema in index '{index_dir}'\n"
-                    f"\tExpected: {expected_fields}\n"
-                    f"\tOn disk:  {actual_fields}\n"
-                    f"Please clear the index (use -c or delete directory)."
-                 )
+                 # [修改] 改进错误提示，更清晰
+                 expected_set = set(expected_fields)
+                 actual_set = set(actual_fields)
+                 missing_in_actual = expected_set - actual_set
+                 extra_in_actual = actual_set - expected_set
+                 error_msg = f"Incompatible schema in index '{index_dir}'\n"
+                 if missing_in_actual: error_msg += f"\tMissing fields on disk: {sorted(list(missing_in_actual))}\n"
+                 if extra_in_actual: error_msg += f"\tUnexpected fields on disk: {sorted(list(extra_in_actual))}\n"
+                 error_msg += f"\tExpected: {expected_fields}\n"
+                 error_msg += f"\tOn disk:  {actual_fields}\n"
+                 error_msg += "Please clear the index (use -c or delete directory)."
+                 raise ValueError(error_msg)
 
         self._clear = _clear
 
         # QueryParser 配置
         self.query_parser = QueryParser('content', IndexMsg.schema, group=OrGroup)
+        # [修改] 搜索 content 和 filename
         self.query_parser.add_plugin(MultifieldPlugin(["content", "filename"]))
 
-        # Highlighter 配置 (使用加粗)
-        # [修改] 增加了 maxchars 和 surround 以获得更多上下文
-        # [修改] 增加了 between=' ... ' 在多个高亮片段间添加省略号
+        # Highlighter 配置 (使用加粗, 增加上下文)
+        # [修改] 配置 ContextFragmenter 和 HtmlFormatter
         self.highlighter = highlight.Highlighter(
-            fragmenter=highlight.ContextFragmenter(maxchars=250, surround=80), # maxchars=片段最大字符数, surround=关键词前后字符数
-            formatter=highlight.HtmlFormatter(tagname="b", between=" ... ") # tagname=高亮标签, between=多片段连接符
+            fragmenter=highlight.ContextFragmenter(maxchars=250, surround=80), # 片段最大字符数, 关键词前后字符数
+            formatter=highlight.HtmlFormatter(tagname="b", between=" ... ") # 高亮标签, 多片段连接符
         )
 
     def retrieve_random_document(self) -> IndexMsg:
@@ -290,10 +297,7 @@ class Indexer:
                  # 如果都没有，final_filter 为 None，不过滤
 
                  logger.debug(f"Executing search with query '{q}' and filter '{final_filter}'")
-                 # Note: 'mask' might not be needed if 'filter' is used correctly.
-                 # Using filter restricts the documents considered *before* scoring.
-                 # Using mask filters *after* scoring, which can affect relevance slightly.
-                 # For simple filtering like chat_id or has_file, 'filter' is usually preferred.
+                 # [修改] 使用 filter 而不是 mask，sortedby='post_time', terms=True 用于高亮
                  result_page = searcher.search_page(q, page_num, page_len, filter=final_filter,
                                                     sortedby='post_time', reverse=True,
                                                     terms=True) # terms=True 用于高亮
@@ -323,19 +327,18 @@ class Indexer:
                              filename=stored_fields.get('filename') # Allow None here
                          )
 
-                         # 高亮 content
+                         # [修改] 高亮 content，使用 highlighter
                          highlighted_content = ""
                          if msg.content: # Only highlight if there is content
                             try:
-                                # [修改] 直接调用 highlight_hit 获取片段，让 Highlighter 配置生效
-                                # 它会返回包含 <b> 标签的 HTML 片段
+                                # 使用 highlighter 获取带 <b> 标签的 HTML 片段
                                 highlighted_content = self.highlighter.highlight_hit(hit, 'content') or ""
+                                # Whoosh 的 fragmenter 会自动处理上下文和行数/字符数限制
                             except Exception as high_e:
                                 logger.error(f"Error highlighting hit {hit.docnum} content: {high_e}")
-                         # 如果无高亮但有内容，取简短原文
+                         # 如果无高亮但有内容，取简短原文 (使用html.escape确保安全)
                          if not highlighted_content and msg.content:
-                              # Use html.escape for safety if brief_content doesn't escape
-                              highlighted_content = html.escape(brief_content(msg.content, 150))
+                              highlighted_content = html.escape(brief_content(msg.content, 150)) # 增加后备长度
 
                          # 将消息和高亮后的文本存入 SearchHit
                          hits.append(SearchHit(msg, highlighted_content))
@@ -374,6 +377,7 @@ class Indexer:
 
 
     def count_by_query(self, **kw):
+        # [注意] 此方法可能不再直接用于 /stat，但保留以备他用
         if self.ix.is_empty(): return 0
         if not kw: return self.ix.doc_count()
         try:
