@@ -67,8 +67,8 @@ $ ip address
 
 ```shell
 docker-compose up --no-start
-docker start tg_searcher_redis
-docker start -ia tg_searcher  # 这时你将需要按指引登入账号，一切完成后 Ctrl-P Ctrl-Q 解离
+docker start tg_searcher_redis2
+docker start -ia tg_searcher2  # 这时你将需要按指引登入账号，一切完成后 Ctrl-P Ctrl-Q 解离
 ```
 
 完成登入后，考虑到安全性，可以注释掉 `docker-compose.yaml` 里标明的两行（不是必须）。
