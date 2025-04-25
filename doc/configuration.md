@@ -4,6 +4,8 @@ Searcher 分为前端和后端两个部分。后端部分是一个 userbot，使
 
 前端负责处理和用户的交互，它可以有多种实现，目前实现了 Telegram bot 的前端。用户通过和这个 bot 账号对话来和后端进行交互，一般的用户可以通过 bot 来搜索消息；管理员除了可以用来搜索消息之外，还可以用它来管理后端的数据。
 
+总结来说前端是TelegramBot，后端是一个普通用户的账号通过api来进行抓取索引。
+
 Searcher 使用 YAML 作为配置文件的格式，默认的配置文件位于 `./searcher.yaml`，用户可以通过命令行参数指定其它的配置文件位置。
 
 在填写配置文件之前，有下面几项准备工作：
@@ -17,7 +19,7 @@ Searcher 使用 YAML 作为配置文件的格式，默认的配置文件位于 `
 ```yaml
 common:
   name: sharzy_test
-  runtime_dir: /var/lib/tg_searcher
+  runtime_dir: /app/config/tg_searcher_data
   api_id: 1234567
   api_hash: 17a89121c4347182b112e15c1517a998
 
@@ -32,10 +34,11 @@ backends:
 frontends:
   - type: bot
     id: public
-    use_backend: pub_idx
+    use_backend: pub_index
     config:
       admin_id: 619376577
       bot_token: 1200617810:CAF930aE75Vbac02K34tR-A8abzZP4uAq98
+      redis: redis:6379
 ```
 
 以下是一个完整的配置文件，包含了所有的可配置项和对应的注释。
@@ -46,7 +49,7 @@ common:
   name: sharzy_test
 
   # 运行时存储索引文件、session 文件等的位置，多个实例可以使用相同的位置
-  runtime_dir: /var/lib/tg_searcher
+  runtime_dir: /app/config/tg_searcher_data
 
   # 用于访问 Telegram 的代理，支持 socks5 和 http 协议，如不需要可以去掉该行
   proxy: socks5://localhost:1080
@@ -59,10 +62,10 @@ sessions:
     phone: '+18352436375'   # 用户的电话号码
 
 backends:
-  - id: pub_index           # 用来标识后端的名称，在配置文件中唯一即可
+  - id: pub_index           # 用来标识公开后端的名称，在配置文件中唯一即可
     use_session: alice      # 后端所使用的 session 的名称
 
-  - id: priv_idx
+  - id: priv_idx            # 用来标识私人后端的名称，在配置文件中唯一即可
     use_session: alice
     config:
       monitor_all: true     # 当启用这一选项的时候，所有的会话均会被监听，新消息全部会被加入索引
@@ -78,7 +81,7 @@ frontends:
       admin_id: 619376577   # 管理员的用户 ID
       bot_token: 1200617810:CAF930aE75Vbac02K34tR-A8abzZP4uAq98
       page_len: 10          # 搜索时每页显示的结果数量，默认为 10
-      redis: localhost:6379 # Redis 服务器的地址，默认为 localhost:6379
+      redis: redis:6379 # Redis 服务器的地址，默认为 redis:6379
       no_redis: localhost:6379 # 不使用 Redis 来持久化部分用户数据
 
   - type: bot
@@ -88,7 +91,7 @@ frontends:
       admin_id: 619376577
       # 不同前端应该使用不同的 bot_token
       bot_token: 2203317382:BkF390ab92kcb1b2ii2b4-1sbc39i20bb12
-      redis: localhost:6379 # Redis 服务器的地址，默认为 localhost:6379
+      redis: redis:6379 # Redis 服务器的地址，默认为 redis:6379
       # 如果开启了 private_mode，那么只有 private_whitelist 里的用户才能使用 bot
       # 管理员默认位于 private_whitelist 中，无需额外添加
       private_mode: true
