@@ -139,7 +139,7 @@ class BotFrontend:
 - 回复选择成功的消息 + 管理命令 (如 /download_chat)，可对该对话执行操作。
 """
     # 文本显示最大字符数
-    MAX_TEXT_DISPLAY_LENGTH = 70
+    MAX_TEXT_DISPLAY_LENGTH = 50
     # 高亮 HTML 安全长度限制 (防止极端情况)
     MAX_HIGHLIGHT_HTML_LENGTH = 350
 
