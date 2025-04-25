@@ -14,7 +14,7 @@ Searcher 使用 YAML 作为配置文件的格式，默认的配置文件位于 `
 2. 如果使用 bot 前端，需要向 [BotFather](https://t.me/BotFather) 申请一个 bot 账号，获取它的 `bot_token`，为了确保管理员能收到 bot 发来的消息，申请之后给 bot 发送一条任意的消息。
 3. 找到管理员的用户 ID，可以通过向 [GetIDs Bot](https://t.me/getidsbot) 发送任意消息来获取自己的用户 ID。
 
-以下是一个最简单的配置文件，注意其中的各个 id 需要修改成用户自己的对应 id：
+以下是一个最简单的配置文件，只需要将 `api_id`  `api_hash`和 `phone`以及 `bot_token`  `admin_id`全部修改为自己的即可使用
 
 ```yaml
 common:
