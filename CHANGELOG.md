@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## [0.6.0] - 2025.04.26
+
+### Added
+* Added filter buttons for search results (All / Text Only / File Only).
+* Added `/usage` command to display bot usage statistics (requires Redis).
+* Added `/s` and `/ss` as aliases for the `/search` command.
+* Added `/help` command to show help messages.
+
+### Changed
+* Improved file indexing (index now includes filename and file flag).
+
+### 新增 (Added)
+* 为搜索结果添加按类型筛选按钮 (全部 / 纯文本 / 仅文件)。
+* 添加 `/usage` 命令以显示机器人用户统计数据 (需要 Redis)。
+* 添加 `/s` 和 `/ss` 作为 `/search` 命令的别名。
+* 添加 `/help` 命令以显示帮助信息。
+
+### 变更 / 改进 (Changed)
+* 改进了文件索引功能 (索引现在包含文件名和文件标记)。
+
+
 ## [0.5.0] - 2024.5.14
 ### Fixed
 - Handle exception that occurs when backend init trys to find a deleted chat
