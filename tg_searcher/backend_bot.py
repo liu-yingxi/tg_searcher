@@ -367,10 +367,6 @@ class BackendBot:
             raise RuntimeError(f"写入索引时出错 for {share_id}")
         finally:
              self._logger.info(f"Finished task: {task_name}")
-    # *************************************************************************
-    # * END OF MODIFIED FUNCTION                                              *
-    # *************************************************************************
-
 
     def clear(self, chat_ids: Optional[List[int]] = None):
         """
@@ -444,10 +440,6 @@ class BackendBot:
             self._logger.error(f"Error finding chat id for '{q}': {e}")
             return [] # 返回空列表表示查找失败
 
-
-    # *************************************************************************
-    # * FUNCTION MODIFIED BELOW (Added Logging)                               *
-    # *************************************************************************
     async def get_index_status(self, length_limit: int = 4000) -> str:
         """获取后端索引状态的文本描述 (修正计数和错误处理逻辑, 增加日志)"""
         cur_len = 0
@@ -643,10 +635,6 @@ class BackendBot:
             logger.debug(f"Could not get sender name for message {getattr(message, 'id', 'N/A')}: {e}")
         return sender_name or '' # Ensure non-None return
 
-
-    # *************************************************************************
-    # * FUNCTION MODIFIED BELOW (Added Monitoring Feedback Logging)           *
-    # *************************************************************************
     def _register_hooks(self):
         """注册 Telethon 事件钩子，用于实时接收和处理消息"""
         self._logger.info("Registering Telethon event handlers...")
@@ -819,6 +807,10 @@ class BackendBot:
                     self._logger.error(f"Error processing deletions batch for {share_id}: {e}", exc_info=True)
             except Exception as e:
                 chat_id_repr = getattr(event, 'chat_id', 'N/A')
+                self._logger.error(f"Error processing deleted event in chat {chat_id_repr}: {e}", exc_info=True)
+
+        self._logger.info("Telethon event handlers registered.")
+
                 self._logger.error(f"Error processing deleted event in chat {chat_id_repr}: {e}", exc_info=True)
 
         self._logger.info("Telethon event handlers registered.")
