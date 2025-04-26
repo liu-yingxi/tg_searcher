@@ -280,10 +280,13 @@ class BotFrontend:
 - 回复带有 "☑️ 已选择" 的消息 + 搜索词，可仅搜索该对话。
 - 回复带有 "☑️ 已选择" 的消息 + 管理命令 (如 /download_chat, /clear)，可对该对话执行操作 (如果命令本身支持)。
 """
-    # 渲染搜索结果时，单条消息内容的最大显示字符数
-    MAX_TEXT_DISPLAY_LENGTH = 250 # 保持这个长度，但确保高亮也遵守类似限制
-    # 高亮 HTML 片段的安全长度限制 (Whoosh 生成的带 <b> 标签的 HTML)
-    MAX_HIGHLIGHT_HTML_LENGTH = 500 # 限制高亮HTML的总长度，防止过长
+    
+    # 渲染搜索结果时，单条消息内容的最大显示字符数 (减少)
+    MAX_TEXT_DISPLAY_LENGTH = 120
+    # 高亮 HTML 片段的安全长度限制 (减少)
+    MAX_HIGHLIGHT_HTML_LENGTH = 300
+    # 文件名显示长度 (新增常量)
+    MAX_FILENAME_DISPLAY_LENGTH = 60
 
     def __init__(self, common_cfg: CommonBotConfig, cfg: BotFrontendConfig, frontend_id: str, backend: BackendBot):
         """初始化 Frontend Bot"""
@@ -739,9 +742,7 @@ class BotFrontend:
                  self._logger.error(f"Failed to answer callback even after encountering an error: {final_e}")
 
 
-    # *************************************************************************
-    # * FUNCTION MODIFIED BELOW                                               *
-    # *************************************************************************
+
     async def _render_response_text(self, result: SearchResult, used_time: float) -> str:
         """
         将搜索结果渲染为发送给用户的 HTML 文本。
@@ -799,33 +800,34 @@ class BotFrontend:
                 link_text_type = "none"       # 标记链接文本的来源
                 escaped_url = html.escape(msg.url) # 转义URL
 
-                # 3.1 文件名优先
+                # 3.1 文件名优先 (使用缩短的长度)
                 if msg.filename:
-                    display_content = f"📎 {html.escape(brief_content(msg.filename, self.MAX_TEXT_DISPLAY_LENGTH))}" # 文件名作为链接文本
+                    display_content = f"📎 {html.escape(brief_content(msg.filename, self.MAX_FILENAME_DISPLAY_LENGTH))}" # 使用较短的文件名长度
                     link_text_type = "filename"
-                    # 如果文件消息也有文本内容，准备在链接下方显示
+                    # 如果文件消息也有文本内容，准备在链接下方显示 (使用缩短的长度)
                     if msg.content:
                         additional_content = html.escape(brief_content(msg.content, self.MAX_TEXT_DISPLAY_LENGTH))
-                # 3.2 其次是高亮文本
+                # 3.2 其次是高亮文本 (检查缩短后的高亮长度限制)
                 elif hit.highlighted:
                     # 检查高亮 HTML 是否过长
                     if len(hit.highlighted) < self.MAX_HIGHLIGHT_HTML_LENGTH:
                         display_content = hit.highlighted # 直接使用 Whoosh 生成的带 <b> 标签的 HTML
                         link_text_type = "highlight"
                     else:
-                        # 高亮过长，剥离 HTML 标签，然后截断并转义
+                        # 高亮过长，剥离 HTML 标签，然后截断并转义 (使用缩短的长度)
                         plain_highlighted = self._strip_html(hit.highlighted)
                         display_content = html.escape(brief_content(plain_highlighted, self.MAX_TEXT_DISPLAY_LENGTH))
                         link_text_type = "content" # 视为普通内容处理
-                        self._logger.debug(f"Highlight HTML for {msg.url} too long ({len(hit.highlighted)}). Using stripped/truncated plain text.")
-                # 3.3 再次是原始文本内容
+                        self._logger.debug(f"Highlight HTML for {msg.url} too long ({len(hit.highlighted)} chars > {self.MAX_HIGHLIGHT_HTML_LENGTH}). Using stripped/truncated plain text.")
+                # 3.3 再次是原始文本内容 (使用缩短的长度)
                 elif msg.content:
                     display_content = html.escape(brief_content(msg.content, self.MAX_TEXT_DISPLAY_LENGTH))
                     link_text_type = "content"
-                # 3.4 最后，如果什么都没有，设置默认链接文本
+                # 3.4 最后，如果什么都没有，设置默认链接文本 (确保链接有内容 - Issue 2)
                 else:
-                     display_content = "查看消息" # 默认链接文本
+                     display_content = "[查看消息]" # Fallback link text
                      link_text_type = "default"
+                     self._logger.debug(f"Message {msg.url} has no filename or content, using default link text.")
 
                 # 4. 构建包含链接的行
                 if display_content: # 确保有内容可以链接
@@ -834,8 +836,9 @@ class BotFrontend:
                     if link_text_type == "filename" and additional_content:
                         sb.append(f"{additional_content}\n")
                 else:
-                    # 理论上不应发生，因为有默认值，但作为保险
+                    # 理论上因为有 fallback 不会执行，但作为保险
                     sb.append(f'<a href="{escaped_url}">[无法显示内容]</a>\n')
+                    self._logger.warning(f"Failed to generate display_content for msg {msg.url}, even with fallback.")
 
                 # 5. 在每个结果后添加一个空行作为分隔
                 sb.append("\n")
@@ -862,9 +865,7 @@ class BotFrontend:
              self._logger.warning(f"Search result text was truncated to {len(final_text)} characters.")
 
         return final_text.strip() # 移除末尾可能多余的空白
-    # *************************************************************************
-    # * END OF MODIFIED FUNCTION                                              *
-    # *************************************************************************
+
 
     def _strip_html(self, text: str) -> str:
         """简单的 HTML 标签剥离器，用于从高亮文本中获取纯文本"""
@@ -1085,11 +1086,6 @@ class BotFrontend:
                          await event.reply(f"🆘 执行搜索时发生内部错误: {type(e).__name__}")
                  else:
                      self._logger.debug("Ignoring message containing only mention or whitespace.")
-
-
-    # ============================================
-    # Command Handlers
-    # ============================================
 
     async def _handle_help_cmd(self, event: events.NewMessage.Event, args_str: str):
         """处理 /help 命令"""
