@@ -12,7 +12,7 @@ version: '3'
 
 services:
   tg_searcher: # 服务名可以不变，但容器名和镜像变了
-    image: non10086/tg_searcher:latest # 指向你的镜像
+    image: non10086/tg_searcher:dev # 指向你的镜像
     container_name: tg_searcher2       # 新的容器名
     restart: unless-stopped            # 修正 restart
     volumes:
