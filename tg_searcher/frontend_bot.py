@@ -24,7 +24,7 @@ try:
     # 确保导入 IndexMsg 用于类型提示
     from .common import CommonBotConfig, get_logger, get_share_id, remove_first_word, brief_content
     from .backend_bot import BackendBot, EntityNotFoundError
-    from .indexer import SearchResult, IndexMsg # <--- 确保 IndexMsg 被导入
+    from .indexer import SearchResult, IndexMsg, SearchHit # <--- 确保 IndexMsg 和 SearchHit 被导入
 except ImportError:
     # 如果作为独立脚本运行或导入失败，提供基本的 fallback 定义
     print("Warning: Assuming relative imports fail, define fallbacks if needed.")
@@ -38,7 +38,7 @@ except ImportError:
         def __init__(self, entity='Unknown'): self.entity = entity; super().__init__(f"Entity not found: {entity}")
     class SearchResult:
         def __init__(self, hits=None, is_last_page=True, total_results=0): self.hits=hits or []; self.is_last_page=is_last_page; self.total_results=total_results
-    # Fallback IndexMsg 定义
+    # Fallback IndexMsg 和 SearchHit 定义
     class IndexMsg:
         def __init__(self, content='', url='', chat_id=0, post_time=None, sender='', filename=None):
             self.content = content
@@ -48,6 +48,10 @@ except ImportError:
             self.sender = sender
             self.filename = filename
             self.has_file = 1 if filename else 0
+    class SearchHit:
+        def __init__(self, msg: IndexMsg, highlighted: str):
+            self.msg = msg
+            self.highlighted = highlighted
 
 
 logger = get_logger('frontend_bot')
@@ -152,7 +156,7 @@ class FakeRedis:
                 return value
             # 如果已过期，则删除键并返回 None
             elif expiry <= time():
-                del self._data[key]
+                if key in self._data: del self._data[key] # 确保删除
         return None # 键不存在或已过期
 
     def set(self, key, val, ex=None):
@@ -214,17 +218,19 @@ class FakeRedis:
     def expire(self, key, seconds):
         """模拟 Redis EXPIRE 命令"""
         if key in self._data:
-            value, _ = self._data[key]
-            # 检查是否已过期
-            if self.get(key) is not None: # Use get to implicitly check expiry
-                expiry = time() + seconds if isinstance(seconds, (int, float)) and seconds > 0 else None
-                if expiry: # Only set if new expiry is valid
-                    self._data[key] = (value, expiry)
+            value, current_expiry = self._data[key]
+            # 只有当键未过期时才更新过期时间
+            if current_expiry is None or current_expiry > time():
+                if isinstance(seconds, (int, float)) and seconds > 0:
+                    new_expiry = time() + seconds
+                    self._data[key] = (value, new_expiry)
                     return 1 # 设置成功
-                else: # If seconds <= 0, treat as delete
+                else: # 如果 seconds <= 0，视为删除
                     del self._data[key]
                     return 1 # "Expire" (delete) successful
-        return 0 # 键不存在或已过期
+            else: # 键已过期，删除它
+                del self._data[key]
+        return 0 # 键不存在
 
     # Fake pipeline for basic usage tracking compatibility
     def pipeline(self):
@@ -526,10 +532,17 @@ class BotFrontend:
                          pipe.get(page_key)
                          results = pipe.execute() # 返回结果列表，顺序与 get 调用一致
                          # 解析获取到的值
-                         current_filter = results[0] or "all" # 过滤器，默认为 'all'
-                         current_chats_str = results[1]      # 对话 ID 字符串，可能为 None
-                         current_query = results[2]          # 原始查询文本，可能为 None
-                         current_page = int(results[3] or 1) # 当前页码，默认为 1
+                         redis_filter = results[0]
+                         redis_chats_str = results[1]
+                         redis_query = results[2]
+                         redis_page = results[3]
+
+                         # 仅当 Redis 返回值不为 None 时才更新，否则保持默认值
+                         if redis_filter is not None: current_filter = redis_filter
+                         if redis_chats_str is not None: current_chats_str = redis_chats_str
+                         if redis_query is not None: current_query = redis_query
+                         if redis_page is not None: current_page = int(redis_page)
+
                      except (RedisResponseError, RedisConnectionError) as e:
                          # 处理 Redis 获取错误
                          self._logger.error(f"Redis error getting search context in callback ({bot_chat_id}:{result_msg_id}): {e}")
@@ -538,8 +551,11 @@ class BotFrontend:
                      except ValueError:
                           # 处理页码转换错误
                           self._logger.error(f"Invalid page number in Redis cache for {bot_chat_id}:{result_msg_id}")
-                          await event.answer("缓存的页码无效。", alert=True)
-                          return
+                          current_page = 1 # 重置为第一页
+                          # 尝试从 Redis 删除无效的页码键
+                          if not self._cfg.no_redis:
+                              try: self._redis.delete(page_key)
+                              except Exception: pass
                      except Exception as e:
                          # 处理其他未知错误
                          self._logger.error(f"Unexpected error getting context from Redis: {e}", exc_info=True)
@@ -553,7 +569,7 @@ class BotFrontend:
                          await event.edit("这次搜索的信息已过期，请重新发起搜索。", buttons=None) # 清除旧按钮
                      except Exception as edit_e:
                          self._logger.warning(f"Failed to edit message to show expired context: {edit_e}")
-                     # 清理可能残留的 Redis 键
+                     # 清理可能残留的 Redis 键 (即使获取失败也尝试清理)
                      if not self._cfg.no_redis:
                          try: self._redis.delete(query_key, chats_key, filter_key, page_key)
                          except Exception as del_e: self._logger.error(f"Error deleting expired Redis keys: {del_e}")
@@ -607,7 +623,7 @@ class BotFrontend:
                  try:
                      # 检查查询是否为空
                      if not current_query or current_query.isspace():
-                         response_text = "请输入有效的搜索关键词。"
+                         response_text = "关联的搜索关键词无效，请重新搜索。"
                          new_buttons = None # 不显示按钮
                          result = None # 标记没有有效结果
                      else:
@@ -676,9 +692,13 @@ class BotFrontend:
                           except Exception as e:
                               self._logger.error(f"Unexpected error setting selected chat context to Redis: {e}")
                               await event.answer("对话已选择，但保存上下文时出错。", alert=True)
+                      else:
+                           await event.answer(f"已选择对话: {chat_name} (无缓存)")
 
-                      # 向 Telegram 确认回调处理完成
-                      await event.answer(f"已选择对话: {chat_name}")
+
+                      # 向 Telegram 确认回调处理完成 (移到最后，无论 Redis 是否成功)
+                      # await event.answer(f"已选择对话: {chat_name}") # 放在上面 else 分支后
+
                  except ValueError:
                      await event.answer("无效的对话 ID。", alert=True)
                  except Exception as e:
@@ -718,11 +738,9 @@ class BotFrontend:
                  # 如果连发送错误提示都失败，记录下来
                  self._logger.error(f"Failed to answer callback even after encountering an error: {final_e}")
 
-    # --- 省略其他方法 (如 _normal_msg_handler, _admin_msg_handler 等) ---
-    # --- 它们不需要修改 ---
 
     # *************************************************************************
-    # * MODIFIED FUNCTION BELOW                        *
+    # * FUNCTION MODIFIED BELOW                                               *
     # *************************************************************************
     async def _render_response_text(self, result: SearchResult, used_time: float) -> str:
         """
@@ -734,10 +752,13 @@ class BotFrontend:
         """
         # 如果结果无效或没有命中，返回提示信息
         if not isinstance(result, SearchResult) or not result.hits:
+             # 如果 total_results > 0 但 hits 为空，说明是无效页码
+             if isinstance(result, SearchResult) and result.total_results > 0:
+                 return f"没有找到相关的消息 (页码无效？总共 {result.total_results} 条)。"
              return "没有找到相关的消息。"
 
         # 使用列表存储消息片段，最后 join
-        sb = [f'找到 {result.total_results} 条结果，耗时 {used_time:.3f} 秒:\n\n']
+        sb = [f'共搜索到 {result.total_results} 个结果，耗时 {used_time:.3f} 秒:\n\n']
         # 遍历当前页的命中结果
         for i, hit in enumerate(result.hits, 1): # 页内序号从 1 开始
             try:
@@ -752,64 +773,69 @@ class BotFrontend:
 
                 # 1. 获取并格式化对话标题
                 try:
+                    # 尝试从后端获取对话名称
                     title = await self.backend.translate_chat_id(msg.chat_id)
                 except EntityNotFoundError:
+                    # 如果找不到实体，使用占位符
                     title = f"未知对话 ({msg.chat_id})"
                 except Exception as te:
+                    # 处理获取名称时的其他错误
                     self._logger.warning(f"Error translating chat_id {msg.chat_id} for rendering: {te}")
                     title = f"对话 {msg.chat_id} (获取名称出错)"
 
                 # 2. 构建消息头 (序号, 粗体标题, 代码块时间)
                 hdr_parts = [f"<b>{i}. {html.escape(title)}</b>"] # 序号和转义后的标题
                 if isinstance(msg.post_time, datetime):
-                    hdr_parts.append(f'<code>[{msg.post_time.strftime("%y-%m-%d %H:%M")}]</code>') # 格式化时间
+                    # 格式化时间戳
+                    hdr_parts.append(f'<code>[{msg.post_time.strftime("%y-%m-%d %H:%M")}]</code>')
                 else:
-                    hdr_parts.append('<code>[无效时间]</code>') # 时间无效时的占位符
+                    # 时间无效时的占位符
+                    hdr_parts.append('<code>[无效时间]</code>')
                 sb.append(' '.join(hdr_parts) + '\n') # 添加消息头和换行
 
                 # 3. 准备要链接的文本内容
-                display_content = ""
-                link_text_type = "none" # 用于决定链接文本是文件名、高亮、内容还是默认
+                display_content = ""          # 用于<a>标签内的文本
+                additional_content = ""       # 用于文件下方的额外文本（如果有）
+                link_text_type = "none"       # 标记链接文本的来源
+                escaped_url = html.escape(msg.url) # 转义URL
 
                 # 3.1 文件名优先
                 if msg.filename:
-                    display_content = f"📎 {html.escape(msg.filename)}"
+                    display_content = f"📎 {html.escape(brief_content(msg.filename, self.MAX_TEXT_DISPLAY_LENGTH))}" # 文件名作为链接文本
                     link_text_type = "filename"
+                    # 如果文件消息也有文本内容，准备在链接下方显示
+                    if msg.content:
+                        additional_content = html.escape(brief_content(msg.content, self.MAX_TEXT_DISPLAY_LENGTH))
                 # 3.2 其次是高亮文本
                 elif hit.highlighted:
                     # 检查高亮 HTML 是否过长
                     if len(hit.highlighted) < self.MAX_HIGHLIGHT_HTML_LENGTH:
-                        display_content = hit.highlighted # 使用 Whoosh 生成的 HTML
+                        display_content = hit.highlighted # 直接使用 Whoosh 生成的带 <b> 标签的 HTML
                         link_text_type = "highlight"
                     else:
-                        # 高亮过长，剥离 HTML 并截断
+                        # 高亮过长，剥离 HTML 标签，然后截断并转义
                         plain_highlighted = self._strip_html(hit.highlighted)
                         display_content = html.escape(brief_content(plain_highlighted, self.MAX_TEXT_DISPLAY_LENGTH))
-                        link_text_type = "content" # 视为普通内容
-                        self._logger.warning(f"Highlight HTML for {msg.url} too long ({len(hit.highlighted)}). Using stripped/truncated plain text.")
+                        link_text_type = "content" # 视为普通内容处理
+                        self._logger.debug(f"Highlight HTML for {msg.url} too long ({len(hit.highlighted)}). Using stripped/truncated plain text.")
                 # 3.3 再次是原始文本内容
                 elif msg.content:
                     display_content = html.escape(brief_content(msg.content, self.MAX_TEXT_DISPLAY_LENGTH))
                     link_text_type = "content"
-                # 3.4 最后，如果什么都没有，准备使用默认链接文本
+                # 3.4 最后，如果什么都没有，设置默认链接文本
                 else:
+                     display_content = "查看消息" # 默认链接文本
                      link_text_type = "default"
 
-                # 4. 构建链接
-                escaped_url = html.escape(msg.url)
-                if link_text_type == "filename":
-                    # 文件名链接
+                # 4. 构建包含链接的行
+                if display_content: # 确保有内容可以链接
                     sb.append(f'<a href="{escaped_url}">{display_content}</a>\n')
-                    # 如果文件还有文本内容，在下一行显示截断的文本内容（不加链接）
-                    if msg.content:
-                        sb.append(f"{html.escape(brief_content(msg.content, self.MAX_TEXT_DISPLAY_LENGTH))}\n")
-                elif link_text_type in ["highlight", "content"]:
-                    # 高亮或普通内容链接
-                    sb.append(f'<a href="{escaped_url}">{display_content}</a>\n')
-                elif link_text_type == "default":
-                    # 如果没有文件名、高亮或内容，使用默认的跳转链接
-                    sb.append(f'<a href="{escaped_url}">跳转到消息</a>\n')
-                # else: link_text_type == "none" (不应发生，因为检查了 msg.url)
+                    # 如果是文件链接且有额外文本，则在下一行添加
+                    if link_text_type == "filename" and additional_content:
+                        sb.append(f"{additional_content}\n")
+                else:
+                    # 理论上不应发生，因为有默认值，但作为保险
+                    sb.append(f'<a href="{escaped_url}">[无法显示内容]</a>\n')
 
                 # 5. 在每个结果后添加一个空行作为分隔
                 sb.append("\n")
@@ -828,16 +854,16 @@ class BotFrontend:
              # 定义截断提示
              cutoff_msg = "\n\n...(结果过多，仅显示部分)"
              # 计算截断点，并尝试在最后一个完整结果后截断
-             cutoff_point = max_len - len(cutoff_msg) - 10 # 留出余量
+             cutoff_point = max_len - len(cutoff_msg) - 20 # 留出更多余量以防万一
              # 从截断点向前查找最后一个双换行符 (通常是一个结果的结束)
              last_nl = final_text.rfind('\n\n', 0, cutoff_point)
              # 如果找到了双换行符，在其后截断，否则在计算出的截断点截断
              final_text = final_text[:last_nl if last_nl != -1 else cutoff_point] + cutoff_msg
              self._logger.warning(f"Search result text was truncated to {len(final_text)} characters.")
 
-        return final_text
+        return final_text.strip() # 移除末尾可能多余的空白
     # *************************************************************************
-    # * END OF MODIFIED FUNCTION                         *
+    # * END OF MODIFIED FUNCTION                                              *
     # *************************************************************************
 
     def _strip_html(self, text: str) -> str:
@@ -845,10 +871,10 @@ class BotFrontend:
         # 使用正则表达式替换所有 <...> 标签为空字符串
         return re.sub('<[^>]*>', '', text) if text else ''
 
-    # --- 省略 _render_respond_buttons 和其他未修改的方法 ---
     def _render_respond_buttons(self, result: SearchResult, cur_page_num: int, current_filter: str = "all") -> Optional[List[List[Button]]]:
         """生成包含中文筛选和翻页按钮的列表 (中文)"""
-        if not isinstance(result, SearchResult) or result.total_results == 0: # 如果没有结果，不显示按钮
+        # 如果没有结果或结果无效，不显示按钮
+        if not isinstance(result, SearchResult) or result.total_results == 0:
             return None
 
         buttons = [] # 存储按钮行
@@ -951,9 +977,11 @@ class BotFrontend:
         """
         user_id = event.sender_id
         chat_id = event.chat_id # Bot 接收消息的 chat_id
-        message_text = event.raw_text # 原始消息文本
+        message = event.message # 获取完整的 Message 对象
+        message_text = message.text if message else "" # 获取文本，处理 None 情况
 
         # 记录接收到的消息
+        # 使用 brief_content 处理可能很长的消息
         self._logger.info(f"Received message: User={user_id}, Chat={chat_id}, Text='{brief_content(message_text, 100)}'")
 
         # 记录用户活动
@@ -970,7 +998,7 @@ class BotFrontend:
                 return # 停止处理
 
         # 2. 检查是否为管理员
-        is_admin = (user_id == self._admin_id)
+        is_admin = (self._admin_id is not None and user_id == self._admin_id) # 确保 admin_id 已解析
 
         # --- 处理逻辑 ---
         # 尝试将消息作为命令处理
@@ -1020,29 +1048,44 @@ class BotFrontend:
                     logger.error(f"Error handling command '{command}': {e}\n{format_exc()}")
                     await event.reply(f"🆘 处理命令时发生内部错误: {type(e).__name__}")
                     command_handled = True
+            elif command: # 如果是 / 开头但不是已知命令
+                logger.debug(f"Unknown command received: /{command}")
+                # 可以选择回复未知命令提示，或者忽略
+                # await event.reply(f"未知命令：`/{command}`。请使用 `/help` 查看可用命令。")
+                command_handled = True # 标记为已处理（忽略也是一种处理）
 
-        # 如果不是命令，或者是一个未知的命令，并且消息不是回复，则尝试作为搜索处理
+
+        # 如果不是已处理的命令，并且消息不是回复，则尝试作为搜索处理
         # (避免将回复消息错误地当作搜索词)
-        if not command_handled and not event.is_reply:
+        # 同时确保 message_text 不为空
+        if not command_handled and message and not message.is_reply and message_text:
              # 确保消息来自私聊或者用户提到了机器人
             mentioned = False
-            if event.mentioned and event.entities:
-                for entity in event.entities:
+            if message.mentioned and message.entities:
+                for entity in message.entities:
+                    # 检查是否提到了机器人自己
                     if isinstance(entity, MessageEntityMentionName) and entity.user_id == self.my_id:
                         mentioned = True; break
             # 在私聊中直接搜索，在群聊中需要 @ 机器人
-            if event.is_private or mentioned:
+            if message.is_private or mentioned:
                  # 将整个消息文本作为搜索查询
                  query_text = message_text.strip()
+                 # 移除可能的 @BotUsername 前缀（如果在群组中 @ 机器人）
+                 if mentioned and self.username and query_text.lower().startswith(f'@{self.username.lower()}'):
+                     query_text = remove_first_word(query_text).strip()
+
                  # 忽略空消息
                  if query_text:
+                     self._logger.info(f"Handling non-command text as search query: '{brief_content(query_text)}'")
                      try:
                          # 调用搜索处理函数 (与 /s 命令相同)
                          await self._handle_search_cmd(event, query_text)
                      except Exception as e:
                          logger.error(f"Error handling non-command search: {e}\n{format_exc()}")
                          await event.reply(f"🆘 执行搜索时发生内部错误: {type(e).__name__}")
-                 # else: 如果消息为空或只包含 @机器人，则不处理
+                 else:
+                     self._logger.debug("Ignoring message containing only mention or whitespace.")
+
 
     # ============================================
     # Command Handlers
@@ -1050,24 +1093,22 @@ class BotFrontend:
 
     async def _handle_help_cmd(self, event: events.NewMessage.Event, args_str: str):
         """处理 /help 命令"""
-        is_admin = (event.sender_id == self._admin_id)
+        is_admin = (self._admin_id is not None and event.sender_id == self._admin_id)
         help_text = self.HELP_TEXT_ADMIN if is_admin else self.HELP_TEXT_USER
         await event.reply(help_text, parse_mode='markdown', link_preview=False)
 
     async def _handle_search_cmd(self, event: events.NewMessage.Event, query_text: str):
         """处理 /s, /search, /ss 命令以及非命令的直接搜索"""
-        # 去除命令本身（如果存在）
-        if query_text.lower().startswith(('/s ', '/search ', '/ss ')):
-            query_text = remove_first_word(query_text)
-        # 移除可能存在的 @BotUsername
-        if self.username and query_text.lower().startswith(f'@{self.username.lower()}'):
-            query_text = remove_first_word(query_text)
-        query_text = query_text.strip()
+        # 这个函数现在也可能被 _message_dispatcher 直接调用，
+        # 因此 query_text 可能已经是处理过的（移除了命令或mention）
+        query_text = query_text.strip() # 确保去除首尾空白
 
-        # 检查查询是否为空
+        # 再次检查查询是否为空（可能在移除命令或mention后变为空）
         if not query_text:
              await event.reply("请输入要搜索的关键词。")
              return
+
+        self._logger.info(f"Executing search for query: '{brief_content(query_text)}'")
 
         # 检查是否回复了 "☑️ 已选择" 消息，以限定搜索范围
         target_chats: Optional[List[int]] = None
@@ -1097,16 +1138,26 @@ class BotFrontend:
                  if selected_chat_id:
                      target_chats = [selected_chat_id]
                      self._logger.info(f"Search restricted to selected chat {selected_chat_id} based on reply.")
+                 else:
+                      self._logger.warning(f"Detected reply to 'selected chat' message, but failed to extract chat_id for search filtering.")
+                      # 可选：通知用户无法根据回复进行筛选
+                      # await event.reply("⚠️ 无法从回复的消息中确定要筛选的对话，将搜索所有对话。")
+
 
         # --- 执行搜索 ---
         start_time = time()
         # 默认搜索所有对话 (None)，除非从回复中确定了 target_chats
-        result = self.backend.search(query_text, target_chats, self._cfg.page_len, 1)
-        search_time = time() - start_time
+        try:
+            result = self.backend.search(query_text, target_chats, self._cfg.page_len, 1) # 总是从第一页开始
+            search_time = time() - start_time
+        except Exception as e:
+            self._logger.error(f"Backend search call failed: {e}", exc_info=True)
+            await event.reply(f"🆘 后端搜索时发生错误: {type(e).__name__}")
+            return
 
         # --- 渲染并发送结果 ---
         response_text = await self._render_response_text(result, search_time)
-        buttons = self._render_respond_buttons(result, 1) # 初始为第一页
+        buttons = self._render_respond_buttons(result, 1) # 初始为第一页, 过滤器默认为 "all"
 
         try:
             sent_msg = await event.reply(response_text, parse_mode='html', buttons=buttons, link_preview=False)
@@ -1124,10 +1175,15 @@ class BotFrontend:
                     pipe = self._redis.pipeline()
                     # 存储查询文本、目标对话列表 (转为逗号分隔字符串)、初始过滤器和页码
                     pipe.set(query_key, query_text, ex=3600) # 1 小时过期
-                    if target_chats: pipe.set(chats_key, ','.join(map(str, target_chats)), ex=3600)
+                    if target_chats:
+                        pipe.set(chats_key, ','.join(map(str, target_chats)), ex=3600)
+                    else:
+                         # 如果 target_chats 为 None 或空，确保 Redis 中没有旧值
+                         pipe.delete(chats_key)
                     pipe.set(filter_key, "all", ex=3600) # 初始过滤器为 all
                     pipe.set(page_key, 1, ex=3600) # 初始页码为 1
                     pipe.execute()
+                    self._logger.debug(f"Search context saved to Redis for msg {result_msg_id}. Query: '{brief_content(query_text)}', Chats: {target_chats}")
                 except (RedisConnectionError, RedisResponseError) as e:
                     self._logger.error(f"Redis error saving search context: {e}")
                     # 可以选择通知用户缓存可能无法工作
@@ -1146,8 +1202,8 @@ class BotFrontend:
         filter_query = args_str.strip() # 获取用户提供的筛选关键词
 
         try:
-            # 从后端获取所有已监控的对话 ID
-            monitored_ids = self.backend.monitored_chats
+            # 从后端获取所有已监控的对话 ID (非排除的)
+            monitored_ids = self.backend.monitored_chats - self.backend.excluded_chats
             if not monitored_ids:
                  await event.reply("目前没有正在监控或已索引的对话。")
                  return
@@ -1156,7 +1212,8 @@ class BotFrontend:
             chat_info = {} # {chat_id: name}
             tasks = [] # 存储并发获取名称的任务
             for chat_id in monitored_ids:
-                 tasks.append(self.backend.translate_chat_id(chat_id))
+                 # 使用 partial 或 lambda 捕获 chat_id
+                 tasks.append(asyncio.create_task(self.backend.translate_chat_id(chat_id), name=f"translate-{chat_id}"))
 
             results = await asyncio.gather(*tasks, return_exceptions=True) # 并发获取
 
@@ -1176,7 +1233,9 @@ class BotFrontend:
                       valid_chats[chat_id] = f"对话 {chat_id} (未知类型: {type(res)})"
 
             if fetch_errors > 0:
-                await event.reply(f"⚠️ 获取部分对话名称时出错 ({fetch_errors} 个)，列表可能不完整。")
+                # 只记录日志，不一定需要打扰用户
+                self._logger.warning(f"Encountered {fetch_errors} errors fetching chat names for /chats list.")
+
 
             # 根据用户输入进行筛选 (不区分大小写)
             filtered_chats = {}
@@ -1197,7 +1256,7 @@ class BotFrontend:
             # 按名称排序对话
             sorted_chats = sorted(filtered_chats.items(), key=lambda item: item[1])
             max_buttons_per_row = 2 # 每行最多按钮数
-            max_total_buttons = 50 # Telegram 消息按钮总数限制 (保守估计)
+            max_total_buttons = 90 # Telegram 消息按钮总数限制约为 100，留些余量
             current_row = []
             button_count = 0
 
@@ -1205,8 +1264,9 @@ class BotFrontend:
                  if button_count >= max_total_buttons:
                      self._logger.warning(f"/chats exceeded max button limit ({max_total_buttons}). Truncating list.")
                      break
-                 # 按钮文本：名称 (截断) + ID
-                 button_text = f"{brief_content(name, 20)} ({chat_id})"
+                 # 按钮文本：名称 (截断)
+                 # 不再显示 ID，因为用户可以通过搜索找到
+                 button_text = brief_content(name, 30) # 稍微加长一点点
                  # 回调数据：'select_chat=chat_id'
                  current_row.append(Button.inline(button_text, f'select_chat={chat_id}'))
                  button_count += 1
@@ -1220,7 +1280,11 @@ class BotFrontend:
 
             # --- 发送消息 ---
             if not buttons: # 如果筛选后没有结果或获取失败
-                 await event.reply("无法生成对话列表。" if fetch_errors else "找不到匹配的对话。")
+                 # 如果有获取错误但列表为空
+                 if fetch_errors > 0 and not valid_chats:
+                      await event.reply("获取对话列表时出错，请稍后再试。")
+                 else: # 正常情况但无匹配
+                      await event.reply("找不到匹配的对话。" if filter_query else "目前没有已索引的对话。")
                  return
 
             message_text = f"找到 {len(filtered_chats)} 个匹配的已索引对话"
@@ -1241,12 +1305,15 @@ class BotFrontend:
             # 从后端获取随机消息
             random_msg = self.backend.rand_msg()
             if not random_msg or not isinstance(random_msg, IndexMsg):
+                 # rand_msg 内部已处理空索引情况并抛出 IndexError
+                 # 此处理论上不应执行，除非 rand_msg 返回非预期类型
                  await event.reply("无法获取随机消息。")
                  return
 
             # --- 渲染随机消息 ---
             # 构建一个临时的 SearchResult 和 SearchHit 用于复用渲染逻辑
-            fake_hit = SearchHit(random_msg, highlighted="") # 没有高亮
+            # 对于随机消息，我们没有搜索词，所以 highlighted 字段为空
+            fake_hit = SearchHit(random_msg, highlighted="")
             fake_result = SearchResult([fake_hit], is_last_page=True, total_results=1)
             # 渲染文本 (耗时设为 0)
             response_text = await self._render_response_text(fake_result, 0.0)
@@ -1259,25 +1326,25 @@ class BotFrontend:
              self._logger.error(f"Error handling /random: {e}", exc_info=True)
              await event.reply("🆘 获取随机消息时发生错误。")
 
-
     async def _handle_download_cmd(self, event: events.NewMessage.Event, args_str: str):
         """处理 /download_chat 命令 (管理员)"""
-        if event.sender_id != self._admin_id: return # 双重检查权限
+        if not (self._admin_id is not None and event.sender_id == self._admin_id): return # 确保管理员有效
 
         try:
             # 使用 shlex 解析参数，处理引号等
+            # 使用 exit_on_error=False 可以在解析错误时捕获 ArgumentError 而不是退出
             args = self.download_arg_parser.parse_args(shlex.split(args_str))
         except ArgumentError as e:
             await event.reply(f"❌ 参数错误: {e}\n\n用法: `/download_chat [--min ID] [--max ID] [对话ID/用户名/链接...]`")
             return
-        except SystemExit: return # ArgumentParser 在 --help 时会 SystemExit
 
-        target_chats = args.chats # 获取对话列表
+        target_chats_input = args.chats # 获取对话输入列表
         min_id, max_id = args.min, args.max
+        target_chat_ids: List[Union[int, str]] = list(target_chats_input) # 用于存储最终处理的ID或字符串
 
         # --- 处理通过回复选择的对话 ---
         selected_chat_id: Optional[int] = None
-        if not target_chats and event.is_reply: # 如果没有在命令中指定对话，并且是回复消息
+        if not target_chat_ids and event.is_reply: # 如果没有在命令中指定对话，并且是回复消息
             replied_msg = await event.get_reply_message()
             if replied_msg and replied_msg.sender_id == self.my_id and replied_msg.text and '☑️ 已选择:' in replied_msg.text:
                  # 尝试从 Redis 或消息文本获取 chat_id
@@ -1295,11 +1362,11 @@ class BotFrontend:
                      except Exception: pass
                  # 如果成功获取，将其加入 target_chats
                  if selected_chat_id:
-                     target_chats = [str(selected_chat_id)] # 解析器期望字符串列表
+                     target_chat_ids = [selected_chat_id] # 解析器期望字符串列表，但后端需要int，这里存int
                      self._logger.info(f"Download target set to {selected_chat_id} based on reply.")
 
         # 如果最终没有指定任何对话
-        if not target_chats:
+        if not target_chat_ids:
             await event.reply("请指定至少一个对话的 ID、用户名、链接，或回复一个已选择的对话消息。")
             return
 
@@ -1312,61 +1379,41 @@ class BotFrontend:
             return
 
         # --- 异步处理每个对话的下载 ---
-        status_msg = await event.reply(f"⏳ 正在准备下载 {len(target_chats)} 个对话...")
+        status_msg = await event.reply(f"⏳ 正在准备下载 {len(target_chat_ids)} 个对话...")
         success_count = 0
         fail_count = 0
         results_log = [] # 存储每个对话的处理结果
+        last_update_time = 0 # 控制更新频率
 
         # 定义下载进度回调函数
         async def progress_callback(chat_identifier: str, current_msg_id: int, dl_count: int):
-            # 每隔一段时间（例如 1000 条消息）更新状态消息
-            if dl_count > 0 and dl_count % 1000 == 0:
+            nonlocal last_update_time
+            now = time()
+            # 每隔 N 秒或 M 条消息更新一次状态
+            if (now - last_update_time > 5) or (dl_count > 0 and dl_count % 1000 == 0) :
                 try:
-                    await status_msg.edit(f"⏳ 正在下载 {chat_identifier}: 已处理 {dl_count} 条消息 (ID: {current_msg_id})...")
+                    await status_msg.edit(f"⏳ 正在下载 {chat_identifier}: 已处理约 {dl_count} 条消息 (当前 ID: {current_msg_id})...")
+                    last_update_time = now
                 except rpcerrorlist.MessageNotModifiedError: pass # 内容未变则忽略
+                except rpcerrorlist.MessageIdInvalidError: pass # 原消息被删则忽略
                 except Exception as e: logger.warning(f"Error updating download progress: {e}")
 
-        # 遍历指定的对话
-        for chat_input in target_chats:
-            chat_identifier = chat_input # 用于日志和回调的标识符
-            try:
-                # 1. 将用户输入解析为 share_id
-                share_id = await self.backend.str_to_chat_id(chat_input)
-                chat_identifier = f"对话 {share_id}" # 更新标识符为 ID
+        # 遍历指定的对话输入
+        tasks = []
+        for chat_input in target_chat_ids:
+             # 创建一个异步任务来处理每个对话
+             tasks.append(self._process_single_download(chat_input, min_id, max_id, progress_callback))
 
-                # 2. 获取对话名称（用于日志）
-                try: chat_name = await self.backend.translate_chat_id(share_id)
-                except Exception: chat_name = "(未知名称)"
-                chat_identifier = f'"{chat_name}" ({share_id})' # 更新标识符
+        # 并发执行所有下载任务
+        download_results = await asyncio.gather(*tasks)
 
-                # 3. 更新状态，准备下载
-                await status_msg.edit(f'⏳ 开始下载 {chat_identifier} (范围: >{min_id} to <{max_id if max_id > 0 else "最新"})')
-
-                # 4. 调用后端下载历史记录
-                start_dl_time = time()
-                # 创建一个局部回调函数，捕获当前的 chat_identifier
-                local_callback = lambda cur_id, count: progress_callback(chat_identifier, cur_id, count)
-                await self.backend.download_history(share_id, min_id, max_id, call_back=local_callback)
-                dl_time = time() - start_dl_time
-
-                # 5. 记录成功结果
-                results_log.append(f"✅ 成功下载并索引 {chat_identifier} (耗时 {dl_time:.2f} 秒)")
+        # 汇总结果
+        for success, message in download_results:
+            if success:
                 success_count += 1
-
-            except EntityNotFoundError as e:
+            else:
                 fail_count += 1
-                results_log.append(f"❌ 找不到对话 {chat_identifier}: {e}")
-            except ValueError as e: # 可能由 backend.download_history 抛出 (例如已排除)
-                fail_count += 1
-                results_log.append(f"❌ 无法下载 {chat_identifier}: {e}")
-            except whoosh.index.LockError:
-                fail_count += 1
-                results_log.append(f"❌ 索引被锁定，无法写入 {chat_identifier} 的数据。")
-                logger.error(f"Index locked during download history for {chat_identifier}")
-            except Exception as e:
-                fail_count += 1
-                results_log.append(f"❌ 下载 {chat_identifier} 时发生未知错误: {type(e).__name__}")
-                logger.error(f"Error downloading history for {chat_identifier}: {e}", exc_info=True)
+            results_log.append(message)
 
         # --- 完成所有下载，报告最终结果 ---
         final_report = f"下载任务完成 ({success_count} 成功, {fail_count} 失败):\n\n" + "\n".join(results_log)
@@ -1374,26 +1421,74 @@ class BotFrontend:
         max_report_len = 4000
         if len(final_report) > max_report_len:
              final_report = final_report[:max_report_len - 50] + "\n\n...(报告过长，已截断)"
-        await status_msg.edit(final_report)
+        try:
+            await status_msg.edit(final_report)
+        except Exception as e:
+            logger.error(f"Failed to edit final download status message: {e}")
+            # 如果编辑失败，尝试发送新消息
+            await event.reply(final_report)
+
+
+    async def _process_single_download(self, chat_input: Union[int, str], min_id: int, max_id: int, progress_callback: callable) -> Tuple[bool, str]:
+        """处理单个对话的下载逻辑，供 _handle_download_cmd 调用"""
+        chat_identifier = str(chat_input) # 用于日志和回调的标识符
+        try:
+            # 1. 将用户输入解析为 share_id
+            # 注意：后端 download_history 期望原始 chat_id，但 str_to_chat_id 返回 share_id
+            # 我们需要先解析为 share_id，然后传递给 download_history
+            # backend_bot 的 download_history 内部会处理 share_id
+            share_id = await self.backend.str_to_chat_id(chat_input)
+            chat_identifier = f"对话 {share_id}" # 更新标识符为 ID
+
+            # 2. 获取对话名称（用于日志和用户反馈）
+            try:
+                chat_name = await self.backend.translate_chat_id(share_id)
+            except Exception:
+                chat_name = "(未知名称)"
+            chat_identifier = f'"{chat_name}" ({share_id})' # 更新标识符
+
+            # 3. 调用后端下载历史记录
+            start_dl_time = time()
+            # 创建一个局部回调函数，捕获当前的 chat_identifier
+            local_callback = lambda cur_id, count: progress_callback(chat_identifier, cur_id, count)
+            # 调用后端的 download_history，它接受 share_id
+            await self.backend.download_history(share_id, min_id, max_id, call_back=local_callback)
+            dl_time = time() - start_dl_time
+
+            # 4. 返回成功结果
+            return True, f"✅ 成功下载并索引 {chat_identifier} (耗时 {dl_time:.2f} 秒)"
+
+        except EntityNotFoundError as e:
+            return False, f"❌ 找不到对话 {chat_identifier}: {e}"
+        except ValueError as e: # 可能由 backend.download_history 抛出 (例如已排除)
+            return False, f"❌ 无法下载 {chat_identifier}: {e}"
+        except whoosh.index.LockError:
+            logger.error(f"Index locked during download history for {chat_identifier}")
+            return False, f"❌ 索引被锁定，无法写入 {chat_identifier} 的数据。"
+        except Exception as e:
+            logger.error(f"Error downloading history for {chat_identifier}: {e}", exc_info=True)
+            return False, f"❌ 下载 {chat_identifier} 时发生未知错误: {type(e).__name__}"
 
 
     async def _handle_clear_cmd(self, event: events.NewMessage.Event, args_str: str):
         """处理 /clear 命令 (管理员)"""
-        if event.sender_id != self._admin_id: return
+        if not (self._admin_id is not None and event.sender_id == self._admin_id): return
 
         try:
+            # 解析参数
             args = self.chat_ids_parser.parse_args(shlex.split(args_str))
         except ArgumentError as e:
             await event.reply(f"❌ 参数错误: {e}\n\n用法: `/clear [对话ID/用户名/链接... | all]`")
             return
-        except SystemExit: return
 
-        target_chats = args.chats
-        clear_all = 'all' in [c.lower() for c in target_chats] # 检查是否包含 'all'
+        target_chats_input = args.chats
+        clear_all = 'all' in [c.lower() for c in target_chats_input] # 检查是否包含 'all'
+        target_chat_ids: List[Union[int, str]] = list(target_chats_input) if not clear_all else []
+
 
         # --- 处理通过回复选择的对话 ---
         selected_chat_id: Optional[int] = None
-        if not target_chats and event.is_reply: # 如果没有在命令中指定对话，并且是回复消息
+        if not target_chat_ids and not clear_all and event.is_reply: # 仅当未指定目标且未指定all时检查回复
             replied_msg = await event.get_reply_message()
             if replied_msg and replied_msg.sender_id == self.my_id and replied_msg.text and '☑️ 已选择:' in replied_msg.text:
                  # 尝试获取 chat_id
@@ -1411,37 +1506,42 @@ class BotFrontend:
                      except Exception: pass
                  # 如果成功获取，将其设为目标
                  if selected_chat_id:
-                     target_chats = [str(selected_chat_id)]
-                     clear_all = False # 回复单个对话时，不清除全部
+                     target_chat_ids = [selected_chat_id] # 存储为 int
                      self._logger.info(f"Clear target set to {selected_chat_id} based on reply.")
 
         # --- 执行清除操作 ---
         if clear_all:
              # 清除全部索引
+             # 添加确认步骤
+             confirm_key = f"{self.id}:confirm_clear_all:{event.chat_id}:{event.sender_id}"
              try:
-                 await event.reply("⚠️ 确认清除 **所有** 对话的索引数据吗？此操作不可逆！\n\n回复此消息 **yes** 确认。")
-                 # 等待用户确认 (例如，监听下一条消息) - 这需要更复杂的会话管理
-                 # 为了简化，这里直接执行清除
-                 # 注意：这有风险，最好添加确认步骤
-                 status_msg = await event.reply("⏳ 正在清除所有索引...")
-                 self.backend.clear(chat_ids=None)
-                 await status_msg.edit("✅ 已清除所有索引数据。")
-             except whoosh.index.LockError:
-                  logger.error("Index locked during clear all.")
-                  await status_msg.edit("❌ 索引被锁定，无法清除全部数据。")
+                 # 使用 Redis 存储确认状态，有效期很短
+                 if not self._cfg.no_redis:
+                     self._redis.set(confirm_key, "pending", ex=60) # 60 秒有效期
+                 await event.reply("⚠️ **警告!** 您确定要清除 **所有** 对话的索引数据吗？此操作不可恢复。\n\n**请在 60 秒内再次发送 `/clear all` 进行确认。**")
+                 return # 等待用户再次发送命令
              except Exception as e:
-                  logger.error(f"Error clearing all index data: {e}", exc_info=True)
-                  await status_msg.edit(f"🆘 清除所有索引时发生错误: {type(e).__name__}")
-        elif target_chats:
+                 logger.error(f"Error setting clear all confirmation: {e}")
+                 await event.reply("设置确认状态时出错，请重试。")
+                 return
+
+        elif target_chat_ids:
              # 清除指定对话
-             status_msg = await event.reply(f"⏳ 正在准备清除 {len(target_chats)} 个对话的索引...")
+             status_msg = await event.reply(f"⏳ 正在准备清除 {len(target_chat_ids)} 个对话的索引...")
              share_ids_to_clear = []
              results_log = []
-             for chat_input in target_chats:
+             processed_inputs = set() # 防止重复处理同一个输入
+
+             for chat_input in target_chat_ids:
+                 if chat_input in processed_inputs: continue
+                 processed_inputs.add(chat_input)
                  try:
                      share_id = await self.backend.str_to_chat_id(chat_input)
                      share_ids_to_clear.append(share_id)
-                     results_log.append(f"准备清除: {chat_input} -> {share_id}")
+                     # 尝试获取名称用于日志
+                     try: name = await self.backend.translate_chat_id(share_id)
+                     except Exception: name = "(未知名称)"
+                     results_log.append(f"准备清除: \"{name}\" ({share_id})")
                  except EntityNotFoundError:
                      results_log.append(f"❌ 找不到对话: {chat_input}")
                  except Exception as e:
@@ -1451,10 +1551,16 @@ class BotFrontend:
                  await status_msg.edit("没有找到有效的对话进行清除。\n\n" + "\n".join(results_log))
                  return
 
-             await status_msg.edit("⏳ 正在清除指定对话的索引...\n\n" + "\n".join(results_log))
+             # 显示准备清除的列表
+             prep_report = "⏳ 准备清除以下对话的索引:\n\n" + "\n".join(results_log)
+             max_prep_len = 3000 # 预留空间给最终结果
+             if len(prep_report) > max_prep_len:
+                  prep_report = prep_report[:max_prep_len] + "\n...(列表过长，已截断)"
+             await status_msg.edit(prep_report)
+             await asyncio.sleep(1) # 短暂暂停让用户看到
+
              try:
-                 # 调用后端清除 (后端接受原始 ID，但内部会转 share_id，这里直接给 share_id 也可以)
-                 # 改为直接传递 share_id 列表给后端
+                 # 调用后端清除 (后端接受 share_id 列表)
                  self.backend.clear(chat_ids=share_ids_to_clear)
                  await status_msg.edit(f"✅ 已清除指定的 {len(share_ids_to_clear)} 个对话的索引数据。")
              except whoosh.index.LockError:
@@ -1463,13 +1569,43 @@ class BotFrontend:
              except Exception as e:
                   logger.error(f"Error clearing specific chats: {e}", exc_info=True)
                   await status_msg.edit(f"🆘 清除指定对话时发生错误: {type(e).__name__}")
+
+        # 处理确认清除全部的逻辑
+        elif args_str.strip().lower() == 'all': # 如果用户再次发送 /clear all
+            confirm_key = f"{self.id}:confirm_clear_all:{event.chat_id}:{event.sender_id}"
+            is_pending = False
+            if not self._cfg.no_redis:
+                try:
+                    if self._redis.get(confirm_key) == "pending":
+                        is_pending = True
+                        self._redis.delete(confirm_key) # 删除确认键
+                except Exception as e:
+                    logger.error(f"Redis error checking clear all confirmation: {e}")
+
+            if is_pending:
+                status_msg = await event.reply("⏳ 确认收到，正在清除所有索引...")
+                try:
+                    self.backend.clear(chat_ids=None)
+                    await status_msg.edit("✅ 已清除所有索引数据。")
+                except whoosh.index.LockError:
+                    logger.error("Index locked during clear all confirmation.")
+                    await status_msg.edit("❌ 索引被锁定，无法清除全部数据。")
+                except Exception as e:
+                    logger.error(f"Error clearing all index data after confirmation: {e}", exc_info=True)
+                    await status_msg.edit(f"🆘 清除所有索引时发生错误: {type(e).__name__}")
+            else:
+                # 如果没有待处理的确认或已过期
+                await event.reply("请先发送 `/clear all` 获取确认提示。")
+
         else:
-             # 没有指定对话，也没有回复
+             # 没有指定对话，也没有回复，也不是确认 all
              await event.reply("请指定要清除的对话 ID/用户名/链接，或回复一个已选择的对话消息，或使用 `all` 清除全部。")
+
 
     async def _handle_stat_cmd(self, event: events.NewMessage.Event, args_str: str):
         """处理 /stat 命令 (管理员)"""
-        if event.sender_id != self._admin_id: return
+        if not (self._admin_id is not None and event.sender_id == self._admin_id): return
+        status_msg = None # 初始化 status_msg
         try:
             status_msg = await event.reply("⏳ 正在获取后端状态...")
             # 调用后端获取状态文本
@@ -1477,16 +1613,23 @@ class BotFrontend:
             await status_msg.edit(status_text, parse_mode='html', link_preview=False)
         except Exception as e:
             logger.error(f"Error getting/sending backend status: {e}", exc_info=True)
-            await status_msg.edit(f"🆘 获取后端状态时出错: {type(e).__name__}")
+            # 如果 status_msg 成功创建，则编辑它，否则发送新消息
+            err_reply = f"🆘 获取后端状态时出错: {type(e).__name__}"
+            try:
+                if status_msg: await status_msg.edit(err_reply)
+                else: await event.reply(err_reply)
+            except Exception as final_e:
+                 logger.error(f"Failed to even send stat error message: {final_e}")
 
     async def _handle_find_chat_id_cmd(self, event: events.NewMessage.Event, args_str: str):
         """处理 /find_chat_id 命令 (管理员)"""
-        if event.sender_id != self._admin_id: return
+        if not (self._admin_id is not None and event.sender_id == self._admin_id): return
         query = args_str.strip()
         if not query:
             await event.reply("请输入要查找的对话关键词 (名称或用户名)。")
             return
 
+        status_msg = None
         try:
             status_msg = await event.reply(f"⏳ 正在查找包含 “{html.escape(query)}” 的对话...")
             # 调用后端查找 chat_id (返回 share_id 列表)
@@ -1500,7 +1643,9 @@ class BotFrontend:
             results_text = [f"找到 {len(found_ids)} 个匹配对话:"]
             tasks = []
             for chat_id in found_ids:
-                 tasks.append(self.backend.translate_chat_id(chat_id))
+                 # 使用 partial 或 lambda 捕获 chat_id
+                 tasks.append(asyncio.create_task(self.backend.translate_chat_id(chat_id), name=f"translate-{chat_id}"))
+
             names = await asyncio.gather(*tasks, return_exceptions=True)
 
             for chat_id, name_res in zip(found_ids, names):
@@ -1517,18 +1662,26 @@ class BotFrontend:
 
         except Exception as e:
             logger.error(f"Error in /find_chat_id handler: {e}", exc_info=True)
-            await status_msg.edit(f"🆘 查找对话 ID 时发生错误: {type(e).__name__}")
+            err_reply = f"🆘 查找对话 ID 时发生错误: {type(e).__name__}"
+            try:
+                 if status_msg: await status_msg.edit(err_reply)
+                 else: await event.reply(err_reply)
+            except Exception as final_e:
+                 logger.error(f"Failed to even send find_chat_id error message: {final_e}")
+
 
     async def _handle_usage_cmd(self, event: events.NewMessage.Event, args_str: str):
         """处理 /usage 命令 (管理员)"""
-        if event.sender_id != self._admin_id: return
+        if not (self._admin_id is not None and event.sender_id == self._admin_id): return
         if self._cfg.no_redis or isinstance(self._redis, FakeRedis):
-            await event.reply("⚠️ 无法获取使用统计，因为 Redis 未启用或连接失败。")
-            return
+            await event.reply("⚠️ 无法获取使用统计，因为 Redis 未启用或连接失败。统计数据可能不准确或不可用。")
+            # 即使使用 FakeRedis，也尝试显示内存中的数据
+            # return
 
+        status_msg = None
         try:
             status_msg = await event.reply("⏳ 正在获取使用统计...")
-            # 从 Redis 获取统计数据
+            # 从 Redis (或 FakeRedis) 获取统计数据
             pipe = self._redis.pipeline()
             pipe.scard(self._TOTAL_USERS_KEY)
             pipe.scard(self._ACTIVE_USERS_KEY)
@@ -1543,14 +1696,25 @@ class BotFrontend:
 - **总互动用户数:** {total_users}
 - **最近 15 分钟活跃用户数:** {active_users}
 """
+            if isinstance(self._redis, FakeRedis):
+                 usage_text += "\n\n*注意: 当前使用内存缓存，统计数据在重启后会丢失。*"
+
             await status_msg.edit(usage_text, parse_mode='markdown')
 
         except (RedisConnectionError, RedisResponseError) as e:
              logger.error(f"Redis error getting usage stats: {e}")
-             await status_msg.edit("❌ 获取统计时 Redis 出错，请检查连接或配置。")
+             err_reply = "❌ 获取统计时 Redis 出错，请检查连接或配置。"
+             try:
+                  if status_msg: await status_msg.edit(err_reply)
+                  else: await event.reply(err_reply)
+             except Exception: pass
         except Exception as e:
              logger.error(f"Error handling /usage: {e}", exc_info=True)
-             await status_msg.edit(f"🆘 获取使用统计时发生内部错误: {type(e).__name__}")
+             err_reply = f"🆘 获取使用统计时发生内部错误: {type(e).__name__}"
+             try:
+                  if status_msg: await status_msg.edit(err_reply)
+                  else: await event.reply(err_reply)
+             except Exception: pass
 
     # --- TODO: 实现其他管理员命令的处理函数 ---
     # async def _handle_monitor_cmd(self, event: events.NewMessage.Event, args_str: str): ...
