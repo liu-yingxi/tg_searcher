@@ -33,7 +33,7 @@ except (ImportError, AttributeError, ModuleNotFoundError):
 
 class IndexMsg:
     """代表一条待索引或已索引消息的数据结构"""
-    # 定义索引的 Schema (结构)
+    # 定义索引的 Schema (结构) - 包含文件相关字段
     schema = Schema(
         content=TEXT(stored=True, analyzer=ChineseAnalyzer()), # 消息内容，使用中文分词
         url=ID(stored=True, unique=True), # 消息链接，作为唯一标识符
@@ -98,10 +98,11 @@ class SearchHit:
 
 class SearchResult:
     """代表一次搜索操作的结果集合"""
-    def __init__(self, hits: List[SearchHit], is_last_page: bool, total_results: int):
+    def __init__(self, hits: List[SearchHit], is_last_page: bool, total_results: int, current_page: int = 1): # 添加 current_page
         self.hits = hits # 当前页的搜索结果列表
         self.is_last_page = is_last_page # 是否为最后一页
         self.total_results = total_results # 匹配的总结果数
+        self.current_page = current_page # 当前页码
 
 
 class Indexer:
@@ -196,15 +197,13 @@ class Indexer:
             except Exception as schema_e:
                  logger.error(f"Error checking index schema compatibility: {schema_e}")
                  # 根据需要决定是否要因为 schema 检查失败而中止
-                 # raise ValueError("Schema check failed.")
+                 raise ValueError("Schema check failed.") # schema 不兼容是严重问题，需要停止
 
         self._clear = _clear # 将内部清理函数赋给实例变量，供外部调用
 
         # --- QueryParser 配置 ---
-        # 初始化查询解析器，默认搜索 'content' 字段
-        # 注意：默认情况下，Whoosh 的 QueryParser 使用 AndGroup，意味着空格分隔的词语默认用 AND 连接
+        # 初始化查询解析器，默认搜索 'content' 和 'filename' 字段
         self.query_parser = QueryParser('content', IndexMsg.schema)
-        # 添加插件，使得搜索同时作用于 'content' 和 'filename' 字段
         self.query_parser.add_plugin(MultifieldPlugin(["content", "filename"]))
 
         # 配置高亮器 (Highlighter)
@@ -286,6 +285,7 @@ class Indexer:
                 if commit_locally and writer: writer.cancel() # 取消写入操作
                 return
             # 确保字段类型符合 Schema 要求
+            # filename 可以为 None，但 Whoosh 添加时最好是空字符串
             doc_data['filename'] = doc_data['filename'] if doc_data['filename'] is not None else ""
             if not isinstance(doc_data['post_time'], datetime):
                 logger.warning(f"Correcting invalid post_time type {type(doc_data['post_time'])} for URL {doc_data['url']} before indexing.")
@@ -316,36 +316,42 @@ class Indexer:
     def search(self, q_str: str, in_chats: Optional[List[int]], page_len: int, page_num: int = 1, file_filter: str = "all") -> SearchResult:
         """
         执行搜索查询。
-        (代码与之前版本基本一致，保持健壮性)
         """
         try:
             q = self.query_parser.parse(q_str)
             logger.debug(f"Parsed query: {q}")
         except Exception as e:
             logger.error(f"Failed to parse query '{q_str}': {e}")
-            return SearchResult([], True, 0) # 返回空结果
+            return SearchResult([], True, 0, page_num) # 返回空结果
 
         searcher = None
         try:
             searcher = self.ix.searcher()
-            base_filter = None
+            # --- 构建过滤器 ---
+            chat_filter = None
             if in_chats:
                 valid_chat_ids = [str(cid) for cid in in_chats if isinstance(cid, int) or (isinstance(cid, str) and cid.lstrip('-').isdigit())]
-                if valid_chat_ids: base_filter = Or([Term('chat_id', cid) for cid in valid_chat_ids])
+                if valid_chat_ids:
+                    chat_filter = Or([Term('chat_id', cid) for cid in valid_chat_ids])
 
             type_filter = None
-            if file_filter == "text_only": type_filter = Term("has_file", 0)
-            elif file_filter == "file_only": type_filter = Term("has_file", 1)
+            if file_filter == "text_only":
+                type_filter = Term("has_file", 0)
+            elif file_filter == "file_only":
+                type_filter = Term("has_file", 1)
 
             final_filter = None
-            if base_filter and type_filter: final_filter = And([base_filter, type_filter])
-            elif base_filter: final_filter = base_filter
-            elif type_filter: final_filter = type_filter
+            filters_to_and = [f for f in [chat_filter, type_filter] if f is not None]
+            if len(filters_to_and) > 1:
+                final_filter = And(filters_to_and)
+            elif len(filters_to_and) == 1:
+                final_filter = filters_to_and[0]
+            # --- 过滤器构建结束 ---
 
             logger.debug(f"Executing search with query='{q}' and filter='{final_filter}' for page {page_num}")
             result_page = searcher.search_page(q, page_num, page_len, filter=final_filter,
                                                sortedby='post_time', reverse=True,
-                                               terms=True)
+                                               terms=True) # terms=True 用于高亮
             logger.debug(f"Search found {result_page.total} results. Page {page_num} has {len(result_page)} hits.")
 
             hits = []
@@ -371,28 +377,40 @@ class Indexer:
                     )
 
                     highlighted_content = ""
+                    # 优先高亮 content 字段
                     if msg.content:
                         try:
-                            # 使用 Whoosh 的高亮器生成 HTML 片段
                             highlighted_content = self.highlighter.highlight_hit(hit, 'content') or ""
                         except Exception as high_e:
                             logger.error(f"Error highlighting hit {hit.docnum} content: {high_e}")
-                            # 如果高亮失败但有内容，使用简短原文作为后备
                             highlighted_content = html.escape(brief_content(msg.content, 150))
+                    # 如果 content 为空但有 filename，尝试高亮 filename（虽然通常意义不大，但保持一致性）
+                    elif msg.filename:
+                        try:
+                            # 注意：MultiFieldPlugin 默认OR连接，高亮可能只匹配一个字段
+                            # 如果用户搜索词只匹配文件名，这里尝试高亮 filename
+                            temp_highlight = self.highlighter.highlight_hit(hit, 'filename') or ""
+                            if temp_highlight:
+                                 highlighted_content = temp_highlight
+                        except Exception as high_e:
+                            logger.error(f"Error highlighting hit {hit.docnum} filename: {high_e}")
+                            # 高亮失败，不设置高亮
 
                     hits.append(SearchHit(msg, highlighted_content))
                 except Exception as e:
                     logger.error(f"Error processing hit {hit.docnum} (URL: {stored_fields.get('url', 'N/A')}): {e}", exc_info=True)
 
-            is_last = (page_num * page_len) >= result_page.total if result_page.total is not None else True
-            return SearchResult(hits, is_last, result_page.total or 0)
+            # 确保 total_results 是整数
+            total_results_int = result_page.total if result_page.total is not None else 0
+            is_last = result_page.is_last_page() if result_page.total is not None else True
+            return SearchResult(hits, is_last, total_results_int, page_num)
 
         except writing.LockError:
             logger.error("Index is locked, cannot perform search.")
-            return SearchResult([], True, 0)
+            return SearchResult([], True, 0, page_num)
         except Exception as e:
             logger.error(f"Search execution failed for query '{q_str}': {e}", exc_info=True)
-            return SearchResult([], True, 0)
+            return SearchResult([], True, 0, page_num)
         finally:
              if searcher: searcher.close()
 
@@ -421,24 +439,25 @@ class Indexer:
         return chat_ids
 
 
-    def count_by_query(self, **kw) -> int:
-        """根据简单的字段=值查询计算文档数量 (用于内部检查或简单统计)"""
+    def count_by_query(self, query: Optional[Term] = None) -> int:
+        """根据 Whoosh Query 对象计算文档数量"""
         if self.ix.is_empty(): return 0
-        if not kw: return self.ix.doc_count()
 
         searcher = None
         try:
-            field, value = list(kw.items())[0]
-            if field == 'has_file': query = Term(field, int(value))
-            else: query = Term(field, str(value))
-
             searcher = self.ix.searcher()
-            return searcher.doc_count(query=query)
-        except (IndexError, ValueError, TypeError):
-            logger.warning(f"Invalid arguments for count_by_query: {kw}. Returning total count.")
-            return self.ix.doc_count()
-        except writing.LockError: logger.error("Index locked, cannot count docs."); return 0
-        except Exception as e: logger.error(f"Error counting docs for {kw}: {e}", exc_info=True); return 0
+            if query is None:
+                # 如果没有提供查询，返回总文档数
+                return searcher.doc_count_all()
+            else:
+                # 使用提供的查询对象计数
+                return searcher.doc_count(query=query)
+        except writing.LockError:
+            logger.error("Index locked, cannot count docs.")
+            return 0
+        except Exception as e:
+            logger.error(f"Error counting docs for query {query}: {e}", exc_info=True)
+            return 0
         finally:
              if searcher: searcher.close()
 
@@ -452,7 +471,8 @@ class Indexer:
             deleted_count = writer.delete_by_term('url', url) # url 是 unique 字段
             writer.commit() # 提交删除
             writer = None # 标记已关闭
-            logger.debug(f"Deleted {deleted_count} doc(s) with URL '{url}'")
+            if deleted_count > 0:
+                 logger.debug(f"Deleted {deleted_count} doc(s) with URL '{url}'")
         except writing.LockError: logger.error(f"Index locked, cannot delete doc by url '{url}'")
         except Exception as e:
              logger.error(f"Error deleting doc by url '{url}': {e}", exc_info=True)
@@ -483,25 +503,27 @@ class Indexer:
     def replace_document(self, url: str, new_fields: dict):
         """
         替换索引中具有相同 URL 的文档。
-        (代码与之前版本基本一致，保持健壮性)
         """
         if not url: raise ValueError("Cannot replace document with empty URL.")
-        required = ['content', 'url', 'chat_id', 'post_time', 'sender']
+        required = ['content', 'url', 'chat_id', 'post_time', 'sender'] # 确保基本字段存在
         missing = [k for k in required if k not in new_fields]
         if missing: raise ValueError(f"Missing required field(s) {missing} for replace url '{url}'")
 
+        # 准备符合 Schema 的数据
         post_time = new_fields.get('post_time', datetime.now())
         if not isinstance(post_time, datetime):
             logger.warning(f"Correcting invalid post_time type {type(post_time)} for replace URL {url}.")
             post_time = datetime.now()
 
+        filename = new_fields.get('filename') # filename 可以是 None
         doc_data = {
-            'content': new_fields.get('content', ''), 'url': url,
+            'content': new_fields.get('content', ''),
+            'url': url,
             'chat_id': str(new_fields.get('chat_id', '0')),
             'post_time': post_time,
             'sender': new_fields.get('sender', ''),
-            'filename': new_fields.get('filename'),
-            'has_file': 1 if new_fields.get('filename') else 0
+            'filename': filename if filename is not None else "", # 存储空字符串而非None
+            'has_file': 1 if filename else 0
         }
 
         writer = None
@@ -538,7 +560,7 @@ class Indexer:
             raise
 
 
-    def is_empty(self, chat_id=None) -> bool:
+    def is_empty(self, chat_id: Optional[Union[int, str]] = None) -> bool:
         """检查索引是否为空，或者特定 chat_id 是否没有文档。"""
         try:
             if self.ix.is_empty(): return True
@@ -549,11 +571,12 @@ class Indexer:
             searcher = None
             try:
                 searcher = self.ix.searcher()
-                q = Term("chat_id", str(chat_id))
+                q = Term("chat_id", str(chat_id)) # Chat ID 在 schema 中是 TEXT
                 return searcher.doc_count(query=q) == 0
             except writing.LockError: logger.error(f"Index locked, cannot check emptiness for chat {chat_id}."); return True
             except Exception as e: logger.error(f"Error checking emptiness for chat {chat_id}: {e}"); return True
             finally:
                  if searcher: searcher.close()
         else:
-            return False # 索引整体不为空
+            # 索引非空，且未指定 chat_id，则返回 False
+            return False
