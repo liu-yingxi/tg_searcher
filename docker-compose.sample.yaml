@@ -13,7 +13,7 @@ version: '3'
 services:
   tg_searcher: # 服务名可以不变，但容器名和镜像变了
     image: non10086/tg_searcher:dev # 指向你的镜像
-    container_name: tg_searcher2       # 新的容器名
+    container_name: tg_searcher3       # 新的容器名
     restart: unless-stopped            # 修正 restart
     volumes:
       - ./config:/app/config         # 映射新目录下的 config
@@ -28,7 +28,7 @@ services:
 
   redis: # 服务名也可以不变，但容器名变了
     image: redis:alpine
-    container_name: tg_searcher_redis2 # 新的 Redis 容器名
+    container_name: tg_searcher_redis3 # 新的 Redis 容器名
     restart: unless-stopped
     command: >-
       redis-server --appendonly yes --appendfilename "redis_db.aof" --appendfsync everysec
@@ -36,4 +36,4 @@ services:
       --aof-load-truncated yes
     volumes:
       # 使用新的、独立的 Redis 数据目录!
-      - ./config/redis_data2:/data   # <--- 修改这里，指向新的子目录
+      - ./config/redis_data3:/data   # <--- 修改这里，指向新的子目录
