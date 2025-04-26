@@ -209,9 +209,6 @@ class BackendBot:
             return True
 
 
-    # *************************************************************************
-    # * FUNCTION MODIFIED BELOW (No structural change needed here currently)  *
-    # *************************************************************************
     async def download_history(self, chat_id: int, min_id: int, max_id: int, call_back: Optional[callable] = None):
         """
         下载指定对话的历史记录并添加到索引。
@@ -468,6 +465,9 @@ class BackendBot:
             self._logger.error(f"Error finding chat id for '{q}': {e}")
             return [] # 返回空列表表示查找失败
 
+    # *************************************************************************
+    # * FUNCTION MODIFIED BELOW (Issue 1: stat count fix - Refined logging)   *
+    # *************************************************************************
     async def get_index_status(self, length_limit: int = 4000) -> str:
         """获取后端索引状态的文本描述 (修正计数和错误处理逻辑, 增加日志)"""
         cur_len = 0
@@ -479,11 +479,18 @@ class BackendBot:
         try:
             self._logger.debug("Attempting to get total document count from index...")
             # 确保索引存在且可读
-            if self._indexer and self._indexer.ix:
-                total_docs = self._indexer.ix.doc_count()
+            if self._indexer and self._indexer.ix and not self._indexer.ix.is_empty():
+                # 尝试打开 searcher 来获取计数，因为 ix.doc_count() 有时可能不准确或引发问题
+                with self._indexer.ix.searcher() as s:
+                    total_docs = s.doc_count_all() # 获取所有文档数
                 self._logger.debug(f"Successfully retrieved total document count: {total_docs}")
+            elif self._indexer and self._indexer.ix and self._indexer.ix.is_empty():
+                total_docs = 0 # 索引存在但是空的
+                self._logger.debug("Index exists but is empty.")
             else:
                 self._logger.error("Indexer or index object is not available.")
+        except writing.LockError:
+            self._logger.error(f"Index locked, failed get total doc count.")
         except Exception as e:
             self._logger.error(f"Failed get total doc count: {e}", exc_info=True) # Log with traceback
         # 添加头部信息 (后端 ID, 会话名, 总消息数)
@@ -529,9 +536,10 @@ class BackendBot:
         # 确保 self.monitored_chats 存在
         monitored_chats_list = []
         if hasattr(self, 'monitored_chats'):
-            monitored_chats_list = sorted(list(self.monitored_chats))
+            # 只包括未被排除的监控对话
+            monitored_chats_list = sorted(list(self.monitored_chats - self.excluded_chats))
 
-        if append_msg([f'总计 {len(monitored_chats_list)} 个对话被加入了索引:\n']):
+        if append_msg([f'总计 {len(monitored_chats_list)} 个对话被加入了索引 (且未被排除):\n']):
             sb.append(overflow_msg); return ''.join(sb)
 
         # 4. 获取每个监控对话的详细信息
@@ -543,14 +551,9 @@ class BackendBot:
                  searcher = self._indexer.ix.searcher() # 在循环外打开 searcher
                  self._logger.debug("Index searcher opened successfully.")
 
-                 # 并发获取名称和计数
-                 count_tasks = {}
+                 # 并发获取名称
                  name_tasks = {}
                  for chat_id in monitored_chats_list:
-                     chat_id_str = str(chat_id)
-                     query = Term('chat_id', chat_id_str)
-                     # Whoosh searcher 操作通常是同步的，难以直接并发
-                     # 先获取所有名称
                      name_tasks[chat_id] = asyncio.create_task(self.format_dialog_html(chat_id))
 
                  # 等待名称获取完成
@@ -569,20 +572,20 @@ class BackendBot:
                  for chat_id in monitored_chats_list:
                      msg_for_chat = []
                      num = -1 # 初始化计数为错误状态 (-1)
-                     chat_id_str = str(chat_id)
+                     chat_id_str = str(chat_id) # 确保是字符串
+                     query = Term('chat_id', chat_id_str) # 构建 Term 查询
 
                      # 尝试获取该对话的文档计数
                      try:
-                         query = Term('chat_id', chat_id_str)
-                         # self._logger.debug(f"Counting documents for chat {chat_id_str} with query: {query}")
+                         self._logger.debug(f"Counting documents for chat {chat_id_str} with query: {query}")
                          num = searcher.doc_count(query=query)
-                         # self._logger.debug(f"Count for chat {chat_id_str}: {num}")
+                         self._logger.debug(f"Count for chat {chat_id_str}: {num}")
                      except searching.SearchError as search_e:
-                         self._logger.error(f"Whoosh SearchError counting docs for chat {chat_id_str}: {search_e}", exc_info=True)
-                         if not detailed_status_error: detailed_status_error = "部分对话计数失败 (SearchError)"
+                         self._logger.error(f"Whoosh SearchError counting docs for chat {chat_id_str} (query={query}): {search_e}", exc_info=True)
+                         if not detailed_status_error: detailed_status_error = f"部分对话计数失败 (SearchError, e.g., chat {chat_id_str})"
                      except Exception as e:
-                         self._logger.error(f"Unexpected error counting docs for chat {chat_id_str}: {e}", exc_info=True)
-                         if not detailed_status_error: detailed_status_error = "部分对话计数失败 (未知错误)"
+                         self._logger.error(f"Unexpected error counting docs for chat {chat_id_str} (query={query}): {e}", exc_info=True)
+                         if not detailed_status_error: detailed_status_error = f"部分对话计数失败 (未知错误, e.g., chat {chat_id_str})"
 
                      # 获取预先格式化好的 HTML 名称
                      chat_html = chat_html_map.get(chat_id, f"对话 `{chat_id}` (未知)")
@@ -619,11 +622,17 @@ class BackendBot:
             finally:
                 # 确保 searcher 对象在使用后被关闭
                 if searcher:
-                    searcher.close()
-                    self._logger.debug("Searcher closed after getting index status.")
+                    try:
+                        searcher.close()
+                        self._logger.debug("Searcher closed after getting index status.")
+                    except Exception as close_e:
+                        self._logger.error(f"Error closing searcher: {close_e}")
         # --- 结束详细信息获取 ---
 
         return ''.join(sb).strip() # 返回前移除末尾空白
+    # *************************************************************************
+    # * END OF MODIFIED FUNCTION                                              *
+    # *************************************************************************
 
     async def translate_chat_id(self, chat_id: int) -> str:
         """使用会话将 Chat ID (share_id) 翻译为名称"""
