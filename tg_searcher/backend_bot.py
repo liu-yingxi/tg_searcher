@@ -210,7 +210,7 @@ class BackendBot:
 
 
     # *************************************************************************
-    # * FUNCTION MODIFIED BELOW                                               *
+    # * FUNCTION MODIFIED BELOW (No structural change needed here currently)  *
     # *************************************************************************
     async def download_history(self, chat_id: int, min_id: int, max_id: int, call_back: Optional[callable] = None):
         """
@@ -225,13 +225,21 @@ class BackendBot:
         self._logger.info(f"Starting task: {task_name} (min={min_id}, max={max_id})")
         share_id = -1 # 初始化为无效值
         try:
-            share_id = get_share_id(chat_id) # 转换为 share_id
+            # 后端应该处理原始ID，内部转换为share_id用于存储和查询
+            # 但iter_messages可能需要原始ID或Peer对象，这里保持传入原始ID给session层
+            # get_share_id主要用于存储到IndexMsg和内部管理(monitored_chats, newest_msg)
+            entity = await self.session.get_entity(chat_id) # 先尝试获取实体
+            share_id = get_share_id(entity.id) # 使用获取到的实体ID生成share_id
+            # 如果 chat_id 本身就是 share_id (-100...), get_entity也能处理
+        except ValueError as e: # get_entity可能抛出ValueError
+             self._logger.error(f"Could not find entity for chat_id {chat_id}. Error: {e}")
+             raise EntityNotFoundError(f"无法找到对话实体: {chat_id}") from e
         except Exception as e:
-            self._logger.error(f"Invalid chat_id format for download: {chat_id}, error: {e}")
-            raise EntityNotFoundError(f"无效的对话 ID 格式: {chat_id}") # 抛出特定的错误类型
+            self._logger.error(f"Error resolving chat_id {chat_id} or getting share_id: {e}", exc_info=True)
+            raise EntityNotFoundError(f"解析对话 ID 时出错: {chat_id}") from e
 
         task_name = f"DownloadHistory-{share_id}" # 更新任务名
-        self._logger.info(f'Downloading history for {share_id} (raw_id={chat_id}, min={min_id}, max={max_id})')
+        self._logger.info(f'Downloading history for {share_id} (input_id={chat_id}, min={min_id}, max={max_id})')
         # 检查对话是否在排除列表中
         if share_id in self.excluded_chats:
             self._logger.warning(f"Skipping download for excluded chat {share_id}.")
@@ -244,8 +252,6 @@ class BackendBot:
             self.monitored_chats.add(share_id)
             # 添加到监控列表的日志反馈
             self._logger.info(f"[Monitoring] Added chat {share_id} to monitored list during download request.")
-            # **建议**: 前端在调用此函数成功后，可以向用户发送一条明确的确认消息，例如:
-            # await event.reply(f"✅ 对话 {chat_name} ({share_id}) 已成功添加到监控列表。")
 
         msg_list: List[IndexMsg] = [] # 存储从 Telegram 获取并准备索引的消息
         downloaded_count: int = 0 # 实际构造了 IndexMsg 的消息数量
@@ -255,10 +261,12 @@ class BackendBot:
 
         try:
             # 使用 Telethon 异步迭代指定对话的消息历史
-            async for tg_message in self.session.iter_messages(entity=share_id, min_id=min_id, max_id=max_id, limit=None, reverse=True): # reverse=True 确保从旧到新处理，便于确定 newest_msg
+            # 传递原始 chat_id 或获取到的 entity 给 iter_messages
+            async for tg_message in self.session.iter_messages(entity=entity, min_id=min_id, max_id=max_id, limit=None, reverse=True): # reverse=True 确保从旧到新处理，便于确定 newest_msg
                 processed_count += 1
                 if not isinstance(tg_message, TgMessage): continue
 
+                # 使用 share_id 构建 URL 和 IndexMsg
                 url = f'https://t.me/c/{share_id}/{tg_message.id}'
                 sender = await self._get_sender_name(tg_message)
                 post_time = tg_message.date
@@ -269,12 +277,15 @@ class BackendBot:
                 msg_text, filename = '', None
                 if tg_message.file and hasattr(tg_message.file, 'name') and tg_message.file.name:
                     filename = tg_message.file.name
+                    # 同时获取可能的文件标题/说明
                     if tg_message.text: msg_text = escape_content(tg_message.text.strip())
                 elif tg_message.text:
                     msg_text = escape_content(tg_message.text.strip())
 
+                # 只有当有文本内容或文件名时才索引
                 if msg_text or filename:
                     try:
+                        # IndexMsg 使用 share_id
                         msg = IndexMsg(content=msg_text or "", url=url, chat_id=share_id, post_time=post_time, sender=sender or "", filename=filename)
                         msg_list.append(msg)
                         downloaded_count += 1
@@ -282,41 +293,45 @@ class BackendBot:
                         newest_msg_in_batch = msg
                     except Exception as create_e:
                         self._logger.error(f"Error creating IndexMsg for {url}: {create_e}")
+                # else: 忽略没有文本和文件名的消息
 
+                # 进度回调和事件循环释放
                 if call_back and processed_count % 100 == 0:
                      try: await call_back(tg_message.id, downloaded_count)
                      except Exception as cb_e: self._logger.warning(f"Error in download callback: {cb_e}")
                 if processed_count % 500 == 0:
+                    self._logger.debug(f"Download progress for {share_id}: Processed {processed_count}, Indexable {downloaded_count}")
                     await asyncio.sleep(0.01) # 释放事件循环
 
             # --- 处理下载错误 ---
-            # ... (错误处理部分保持不变) ...
         except telethon.errors.rpcerrorlist.ChannelPrivateError as e:
-            self._logger.error(f"Permission denied for chat {share_id}. Is the backend account a member? Error: {e}")
+            self._logger.error(f"Permission denied for chat {chat_id} ({share_id}). Is the backend account a member? Error: {e}")
             self.monitored_chats.discard(share_id) # 移除无法访问的对话
             if is_newly_monitored: self._logger.info(f"[Monitoring] Removed newly added chat {share_id} due to access error.")
             raise EntityNotFoundError(f"无法访问对话 {chat_id} ({share_id})，请确保后端账号是其成员。") from e
         except (telethon.errors.rpcerrorlist.ChatIdInvalidError, telethon.errors.rpcerrorlist.PeerIdInvalidError):
-            self._logger.error(f"Chat ID {share_id} (raw: {chat_id}) invalid or peer not found.")
+            self._logger.error(f"Chat ID {chat_id} ({share_id}) invalid or peer not found.")
             self.monitored_chats.discard(share_id)
             if is_newly_monitored: self._logger.info(f"[Monitoring] Removed newly added chat {share_id} due to invalid ID.")
             raise EntityNotFoundError(f"无效对话 ID 或无法找到 Peer: {chat_id} ({share_id})")
         except ValueError as e:
+             # Telethon 的 get_entity 或 iter_messages 可能在找不到实体时抛出 ValueError
              if "Cannot find any entity corresponding to" in str(e) or "Could not find the input entity for" in str(e):
-                 self._logger.error(f"Cannot find entity for chat {share_id} (raw: {chat_id}). Error: {e}")
+                 self._logger.error(f"Cannot find entity for chat {chat_id} ({share_id}). Error: {e}")
                  self.monitored_chats.discard(share_id)
                  if is_newly_monitored: self._logger.info(f"[Monitoring] Removed newly added chat {share_id} due to entity not found.")
                  raise EntityNotFoundError(f"无法找到对话实体: {chat_id} ({share_id})") from e
              else:
+                 # 其他类型的 ValueError
                  self._logger.error(f"ValueError iterating messages for {share_id}: {e}", exc_info=True)
-                 raise # 重新抛出
+                 raise RuntimeError(f"下载对话 {share_id} 时发生值错误") from e
         except Exception as e:
             self._logger.error(f"Error iterating messages for {share_id}: {e}", exc_info=True)
             # 如果在下载过程中出错，也考虑移除（如果刚添加的话）
             if is_newly_monitored:
                 self.monitored_chats.discard(share_id)
                 self._logger.info(f"[Monitoring] Removed newly added chat {share_id} due to download error.")
-            raise RuntimeError(f"下载对话 {share_id} 时发生未知错误")
+            raise RuntimeError(f"下载对话 {share_id} 时发生未知错误") from e
 
         # --- 批量写入索引 ---
         self._logger.info(f'History fetch complete for {share_id}: {downloaded_count} messages to index out of {processed_count} processed.')
@@ -327,26 +342,35 @@ class BackendBot:
 
         writer: Optional[IndexWriter] = None
         try:
+            # 使用优化后的批量写入模式
+            self._logger.info(f"Starting batch write for {len(msg_list)} messages from chat {share_id}...")
+            # 一次性获取 writer
             writer = self._indexer.ix.writer()
             for i, msg in enumerate(msg_list):
                 try:
-                    self._indexer.add_document(msg, writer)
+                    # 直接调用 add_document，传递 writer
+                    self._indexer.add_document(msg, writer=writer)
                     indexed_count_in_batch += 1
-                    if i > 0 and i % 1000 == 0:
-                        self._logger.debug(f"Batch write progress for {share_id}: {i} messages added...")
-                        await asyncio.sleep(0.01)
+                    # 减少日志频率，避免刷屏
+                    if i > 0 and (i + 1) % 5000 == 0:
+                        self._logger.debug(f"Batch write progress for {share_id}: {i+1}/{len(msg_list)} messages added...")
+                        await asyncio.sleep(0.01) # 短暂释放
                 except Exception as add_e:
                     self._logger.error(f"Error adding document {msg.url} to batch writer: {add_e}")
+            # 循环结束后提交
             writer.commit()
-            self._logger.info(f'Write index commit ok for {indexed_count_in_batch} messages from chat {share_id}')
+            self._logger.info(f'Write index commit successful for {indexed_count_in_batch} messages from chat {share_id}')
             # 更新该对话的最新消息缓存
             if newest_msg_in_batch:
-                 current_chat_id = int(newest_msg_in_batch.chat_id)
+                 # newest_msg_in_batch.chat_id 已经是 share_id
+                 current_chat_id = newest_msg_in_batch.chat_id
+                 # 检查缓存中是否已有记录，以及新消息是否更新
                  if current_chat_id not in self.newest_msg or newest_msg_in_batch.post_time > self.newest_msg[current_chat_id].post_time:
                       self.newest_msg[current_chat_id] = newest_msg_in_batch
                       self._logger.debug(f"Updated newest msg cache for {current_chat_id} to {newest_msg_in_batch.url}")
+
         except writing.LockError:
-            self._logger.error("Index is locked during batch write. Downloaded messages are lost.")
+            self._logger.error("Index is locked during batch write. Downloaded messages are lost for this batch.")
             if writer and not writer.is_closed:
                 try: writer.cancel()
                 except Exception as cancel_e: self._logger.error(f"Error cancelling writer after lock: {cancel_e}")
@@ -366,27 +390,25 @@ class BackendBot:
                  self._logger.info(f"[Monitoring] Removed newly added chat {share_id} due to index write error during initial write.")
             raise RuntimeError(f"写入索引时出错 for {share_id}")
         finally:
+             # 确保 writer 被关闭（即使在 commit() 之后也需要）
+             if writer and not writer.is_closed:
+                 try:
+                     # 如果出现异常，commit 可能未执行，cancel 是更安全的选择
+                     writer.cancel() # 或者根据是否有异常决定 commit/cancel
+                 except Exception as final_cancel_e:
+                     self._logger.error(f"Error ensuring writer closure: {final_cancel_e}")
              self._logger.info(f"Finished task: {task_name}")
 
     def clear(self, chat_ids: Optional[List[int]] = None):
         """
         清除索引数据。
 
-        :param chat_ids: 可选，要清除的 chat_id 列表 (原始ID或share_id皆可)。如果为 None，则清除所有索引。
+        :param chat_ids: 可选，要清除的 chat_id 列表 (接收 share_id)。如果为 None，则清除所有索引。
         """
         if chat_ids is not None:
             # 清除指定对话的数据
-            share_ids_to_clear = set()
-            invalid_inputs = []
-            for cid in chat_ids:
-                try:
-                    # 尝试直接作为int或str获取share_id
-                    share_ids_to_clear.add(get_share_id(cid))
-                except Exception:
-                    invalid_inputs.append(str(cid))
+            share_ids_to_clear = set(chat_ids) # 假设传入的就是 share_id 列表
 
-            if invalid_inputs:
-                self._logger.warning(f"Invalid chat IDs provided for clearing: {', '.join(invalid_inputs)}")
             if not share_ids_to_clear:
                 self._logger.warning("No valid share IDs to clear.")
                 return # 如果没有有效的 ID，则不执行任何操作
@@ -397,14 +419,20 @@ class BackendBot:
                 with self._indexer.ix.writer() as w:
                     total_deleted = 0
                     for share_id in share_ids_to_clear:
+                        # 确保使用字符串形式的 share_id 进行 Term 查询
                         deleted_count = w.delete_by_term('chat_id', str(share_id))
                         total_deleted += deleted_count
                         # 从监控列表和最新消息缓存中移除
-                        if self.monitored_chats.discard(share_id): # discard 不会抛错
+                        if share_id in self.monitored_chats:
+                           self.monitored_chats.discard(share_id)
                            self._logger.info(f'[Monitoring] Chat {share_id} removed from monitoring due to /clear command.')
-                        if self.newest_msg.pop(share_id, None):
+                        if share_id in self.newest_msg:
+                           del self.newest_msg[share_id]
                            self._logger.debug(f'Removed newest msg cache for cleared chat {share_id}')
-                        self._logger.info(f'Cleared {deleted_count} docs for chat {share_id}')
+                        if deleted_count > 0:
+                            self._logger.info(f'Cleared {deleted_count} docs for chat {share_id}')
+                        else:
+                            self._logger.debug(f'No docs found to clear for chat {share_id}')
                     self._logger.info(f"Total {total_deleted} documents deleted for specified chats.")
             except writing.LockError:
                 self._logger.error(f"Index locked. Failed to clear index for chats {share_ids_to_clear}.")
@@ -433,7 +461,7 @@ class BackendBot:
     async def find_chat_id(self, q: str) -> List[int]:
         """使用会话查找匹配关键词的对话 ID (返回 share_id 列表)"""
         try:
-            # 调用 session 的方法查找对话 ID
+            # 调用 session 的方法查找对话 ID (它应该返回 share_id)
             return await self.session.find_chat_id(q)
         except Exception as e:
             # 记录查找对话 ID 时的错误
@@ -450,8 +478,12 @@ class BackendBot:
         total_docs = -1 # 标记获取失败
         try:
             self._logger.debug("Attempting to get total document count from index...")
-            total_docs = self._indexer.ix.doc_count()
-            self._logger.debug(f"Successfully retrieved total document count: {total_docs}")
+            # 确保索引存在且可读
+            if self._indexer and self._indexer.ix:
+                total_docs = self._indexer.ix.doc_count()
+                self._logger.debug(f"Successfully retrieved total document count: {total_docs}")
+            else:
+                self._logger.error("Indexer or index object is not available.")
         except Exception as e:
             self._logger.error(f"Failed get total doc count: {e}", exc_info=True) # Log with traceback
         # 添加头部信息 (后端 ID, 会话名, 总消息数)
@@ -464,143 +496,208 @@ class BackendBot:
         def append_msg(msg_list: List[str]) -> bool:
             nonlocal cur_len
             new_len = sum(len(msg) for msg in msg_list)
-            if cur_len + new_len > length_limit - len(overflow_msg) - 50:
+            # 调整检查逻辑，确保在接近限制时停止
+            if cur_len + new_len > length_limit - len(overflow_msg) - 100: # 增加预留空间
                 return True # 返回 True 表示超出限制
             cur_len += new_len
             sb.extend(msg_list)
             return False # 返回 False 表示未超出限制
 
         # 2. 显示排除列表
-        if self.excluded_chats:
+        # 确保 self.excluded_chats 存在且非空
+        if hasattr(self, 'excluded_chats') and self.excluded_chats:
             excluded_list = sorted(list(self.excluded_chats))
             if append_msg([f'{len(excluded_list)} 个对话被禁止索引:\n']):
                 sb.append(overflow_msg); return ''.join(sb)
-            for chat_id in excluded_list:
-                try: chat_html = await self.format_dialog_html(chat_id)
-                except Exception: chat_html = f"对话 `{chat_id}` (获取名称出错)"
-                if append_msg([f'- {chat_html}\n']):
-                    sb.append(overflow_msg); return ''.join(sb)
-            if sb and sb[-1] != '\n\n': sb.append('\n')
+            # 使用 asyncio.gather 并发获取名称
+            tasks = [self.format_dialog_html(chat_id) for chat_id in excluded_list]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                 if isinstance(res, Exception):
+                     # 记录错误，但列表中可能难以对应回 chat_id
+                     self._logger.warning(f"Error formatting dialog HTML for excluded chat: {res}")
+                     # 可以添加一个通用错误提示，或者忽略格式化失败的项
+                     if append_msg([f"- [获取名称出错]\n"]):
+                         sb.append(overflow_msg); return ''.join(sb)
+                 elif isinstance(res, str):
+                      if append_msg([f'- {res}\n']):
+                         sb.append(overflow_msg); return ''.join(sb)
+
+            if sb and not sb[-1].endswith('\n\n'): sb.append('\n') # 确保段落间有空行
 
         # 3. 显示监控列表和计数
-        monitored_chats_list = sorted(list(self.monitored_chats))
+        # 确保 self.monitored_chats 存在
+        monitored_chats_list = []
+        if hasattr(self, 'monitored_chats'):
+            monitored_chats_list = sorted(list(self.monitored_chats))
+
         if append_msg([f'总计 {len(monitored_chats_list)} 个对话被加入了索引:\n']):
             sb.append(overflow_msg); return ''.join(sb)
 
         # 4. 获取每个监控对话的详细信息
         detailed_status_error = None
-        self._logger.debug(f"Getting status for {len(monitored_chats_list)} monitored chats.")
-        try:
-             self._logger.debug("Attempting to open index searcher for chat counts...")
-             searcher = self._indexer.ix.searcher() # 在循环外打开 searcher
-             self._logger.debug("Index searcher opened successfully.")
-             for chat_id in monitored_chats_list:
-                 msg_for_chat = []
-                 num = -1 # 初始化计数为错误状态 (-1)
-                 chat_id_str = str(chat_id)
+        if monitored_chats_list: # 仅当有监控对话时才尝试打开 searcher
+            self._logger.debug(f"Getting status for {len(monitored_chats_list)} monitored chats.")
+            try:
+                 self._logger.debug("Attempting to open index searcher for chat counts...")
+                 searcher = self._indexer.ix.searcher() # 在循环外打开 searcher
+                 self._logger.debug("Index searcher opened successfully.")
 
-                 # 尝试获取该对话的文档计数
-                 try:
+                 # 并发获取名称和计数
+                 count_tasks = {}
+                 name_tasks = {}
+                 for chat_id in monitored_chats_list:
+                     chat_id_str = str(chat_id)
                      query = Term('chat_id', chat_id_str)
-                     self._logger.debug(f"Counting documents for chat {chat_id_str} with query: {query}")
-                     num = searcher.doc_count(query=query)
-                     self._logger.debug(f"Count for chat {chat_id_str}: {num}")
-                 except searching.SearchError as search_e:
-                     self._logger.error(f"Whoosh SearchError counting docs for chat {chat_id_str}: {search_e}", exc_info=True)
-                     if not detailed_status_error: detailed_status_error = "部分对话计数失败 (SearchError)"
-                 except Exception as e:
-                     self._logger.error(f"Unexpected error counting docs for chat {chat_id_str}: {e}", exc_info=True)
-                     if not detailed_status_error: detailed_status_error = "部分对话计数失败 (未知错误)"
+                     # Whoosh searcher 操作通常是同步的，难以直接并发
+                     # 先获取所有名称
+                     name_tasks[chat_id] = asyncio.create_task(self.format_dialog_html(chat_id))
 
-                 # 尝试获取对话名称
-                 try:
-                     chat_html = await self.format_dialog_html(chat_id)
-                 except Exception as name_e:
-                     self._logger.error(f"Error getting name for chat {chat_id}: {name_e}")
-                     chat_html = f"对话 `{chat_id}` (获取名称出错)"
+                 # 等待名称获取完成
+                 name_results = await asyncio.gather(*name_tasks.values(), return_exceptions=True)
+                 chat_html_map = {}
+                 name_idx = 0
+                 for chat_id in monitored_chats_list:
+                      res = name_results[name_idx]
+                      if isinstance(res, Exception):
+                          chat_html_map[chat_id] = f"对话 `{chat_id}` (获取名称出错)"
+                      else:
+                          chat_html_map[chat_id] = res
+                      name_idx += 1
 
-                 # 组合对话信息和计数结果
-                 count_str = "[计数失败]" if num < 0 else str(num)
-                 msg_for_chat.append(f'- {chat_html} 共 {count_str} 条消息\n')
+                 # 依次获取计数并组合消息
+                 for chat_id in monitored_chats_list:
+                     msg_for_chat = []
+                     num = -1 # 初始化计数为错误状态 (-1)
+                     chat_id_str = str(chat_id)
 
-                 # 添加该对话的最新消息信息
-                 if newest_msg := self.newest_msg.get(chat_id):
-                     display_parts = []
-                     if newest_msg.filename: display_parts.append(f"📎 {newest_msg.filename}")
-                     if newest_msg.content: display_parts.append(brief_content(newest_msg.content))
-                     display = " ".join(display_parts) if display_parts else "(空消息)"
-                     esc_display = html.escape(display)
-                     time_str = newest_msg.post_time.strftime("%y-%m-%d %H:%M") if isinstance(newest_msg.post_time, datetime) else "[未知时间]"
-                     msg_for_chat.append(f'  最新: <a href="{html.escape(newest_msg.url)}">{esc_display}</a> (@{time_str})\n')
+                     # 尝试获取该对话的文档计数
+                     try:
+                         query = Term('chat_id', chat_id_str)
+                         # self._logger.debug(f"Counting documents for chat {chat_id_str} with query: {query}")
+                         num = searcher.doc_count(query=query)
+                         # self._logger.debug(f"Count for chat {chat_id_str}: {num}")
+                     except searching.SearchError as search_e:
+                         self._logger.error(f"Whoosh SearchError counting docs for chat {chat_id_str}: {search_e}", exc_info=True)
+                         if not detailed_status_error: detailed_status_error = "部分对话计数失败 (SearchError)"
+                     except Exception as e:
+                         self._logger.error(f"Unexpected error counting docs for chat {chat_id_str}: {e}", exc_info=True)
+                         if not detailed_status_error: detailed_status_error = "部分对话计数失败 (未知错误)"
 
-                 # 检查长度并尝试添加
-                 if append_msg(msg_for_chat):
-                     sb.append(overflow_msg); break # 超出则跳出循环
+                     # 获取预先格式化好的 HTML 名称
+                     chat_html = chat_html_map.get(chat_id, f"对话 `{chat_id}` (未知)")
 
-             if detailed_status_error and not (sb and sb[-1].endswith(overflow_msg)):
-                 if append_msg([f"\n警告: {detailed_status_error}\n"]):
+                     # 组合对话信息和计数结果
+                     count_str = "[计数失败]" if num < 0 else str(num)
+                     msg_for_chat.append(f'- {chat_html} 共 {count_str} 条消息\n')
+
+                     # 添加该对话的最新消息信息
+                     if newest_msg := self.newest_msg.get(chat_id):
+                         display_parts = []
+                         if newest_msg.filename: display_parts.append(f"📎 {html.escape(brief_content(newest_msg.filename, 30))}") # 限制文件名长度
+                         if newest_msg.content: display_parts.append(html.escape(brief_content(newest_msg.content, 50))) # 限制内容长度
+                         display = " ".join(display_parts) if display_parts else "(空消息)"
+                         time_str = newest_msg.post_time.strftime("%y-%m-%d %H:%M") if isinstance(newest_msg.post_time, datetime) else "[未知时间]"
+                         msg_for_chat.append(f'  最新: <a href="{html.escape(newest_msg.url)}">{display}</a> (@{time_str})\n')
+
+                     # 检查长度并尝试添加
+                     if append_msg(msg_for_chat):
+                         sb.append(overflow_msg); break # 超出则跳出循环
+
+                 if detailed_status_error and not (sb and sb[-1].endswith(overflow_msg)):
+                     if append_msg([f"\n警告: {detailed_status_error}\n"]):
+                         sb.append(overflow_msg)
+
+            except writing.LockError:
+                 self._logger.error(f"Index locked, failed to open searcher for status.")
+                 if append_msg(["\n错误：索引被锁定，无法获取详细对话状态。\n"]):
                      sb.append(overflow_msg)
-
-        except writing.LockError:
-             self._logger.error(f"Index locked, failed to open searcher for status.")
-             if append_msg(["\n错误：索引被锁定，无法获取详细对话状态。\n"]):
-                 sb.append(overflow_msg)
-        except Exception as e:
-             self._logger.error(f"Failed to get detailed status (outside chat loop): {e}", exc_info=True)
-             if append_msg(["\n错误：无法获取详细状态。\n"]):
-                 sb.append(overflow_msg)
-        finally:
-            # 确保 searcher 对象在使用后被关闭
-            if searcher:
-                searcher.close()
-                self._logger.debug("Searcher closed after getting index status.")
+            except Exception as e:
+                 self._logger.error(f"Failed to get detailed status (outside chat loop): {e}", exc_info=True)
+                 if append_msg(["\n错误：无法获取详细状态。\n"]):
+                     sb.append(overflow_msg)
+            finally:
+                # 确保 searcher 对象在使用后被关闭
+                if searcher:
+                    searcher.close()
+                    self._logger.debug("Searcher closed after getting index status.")
         # --- 结束详细信息获取 ---
 
-        return ''.join(sb)
+        return ''.join(sb).strip() # 返回前移除末尾空白
 
     async def translate_chat_id(self, chat_id: int) -> str:
         """使用会话将 Chat ID (share_id) 翻译为名称"""
         try:
-            return await self.session.translate_chat_id(int(chat_id))
-        except (telethon.errors.rpcerrorlist.ChannelPrivateError, telethon.errors.rpcerrorlist.ChatIdInvalidError, ValueError, TypeError) as e:
+            # 确保传入的是整数
+            chat_id_int = int(chat_id)
+            return await self.session.translate_chat_id(chat_id_int)
+        except (ValueError, TypeError):
+             # 处理 chat_id 无法转换为整数的情况
+             self._logger.warning(f"Invalid chat_id type for translation: {chat_id} ({type(chat_id)})")
+             raise EntityNotFoundError(f"无效的 Chat ID 格式: {chat_id}")
+        except (telethon.errors.rpcerrorlist.ChannelPrivateError, telethon.errors.rpcerrorlist.ChatIdInvalidError) as e:
             self._logger.warning(f"Could not translate chat_id {chat_id}: {type(e).__name__}")
             raise EntityNotFoundError(f"无法访问或无效 Chat ID: {chat_id}")
         except EntityNotFoundError:
             self._logger.warning(f"Entity not found for {chat_id} during translation.")
             raise
         except Exception as e:
-            self._logger.error(f"Error translating chat_id {chat_id}: {e}")
+            self._logger.error(f"Error translating chat_id {chat_id}: {e}", exc_info=True)
             raise EntityNotFoundError(f"获取对话 {chat_id} 名称时出错") from e
 
 
-    async def str_to_chat_id(self, chat: str) -> int:
-        """将字符串（用户名、链接或 ID）转换为 share_id"""
-        try:
-            return get_share_id(int(chat))
-        except ValueError:
+    async def str_to_chat_id(self, chat: Union[str, int]) -> int:
+        """将字符串（用户名、链接或 ID）或整数 ID 转换为 share_id"""
+        # 首先处理整数输入
+        if isinstance(chat, int):
             try:
-                return get_share_id(await self.session.str_to_chat_id(chat))
-            except EntityNotFoundError:
-                self._logger.warning(f"Entity not found for '{chat}' using session.")
-                raise
-            except Exception as e_inner:
-                self._logger.error(f"Error converting '{chat}' to chat_id via session: {e_inner}")
-                raise EntityNotFoundError(f"解析 '{chat}' 时出错") from e_inner
-        except Exception as e_outer:
-            self._logger.error(f"Error converting '{chat}' to chat_id directly: {e_outer}")
-            raise EntityNotFoundError(f"解析 '{chat}' 时出错") from e_outer
+                # 假设整数已经是 peer_id 或 share_id，直接用 get_share_id 处理
+                return get_share_id(chat)
+            except Exception as e_int:
+                self._logger.error(f"Error converting int '{chat}' to share_id directly: {e_int}")
+                raise EntityNotFoundError(f"解析整数 ID '{chat}' 时出错") from e_int
+
+        # 处理字符串输入
+        elif isinstance(chat, str):
+            chat_str = chat.strip()
+            # 尝试直接将字符串转为整数 ID 处理
+            try:
+                return get_share_id(int(chat_str))
+            except ValueError:
+                # 如果不能直接转为整数，则使用 session 的方法解析用户名、链接等
+                try:
+                    # session.str_to_chat_id 应该返回 peer_id
+                    peer_id = await self.session.str_to_chat_id(chat_str)
+                    # 将获取的 peer_id 转换为 share_id
+                    return get_share_id(peer_id)
+                except EntityNotFoundError:
+                    self._logger.warning(f"Entity not found for '{chat_str}' using session.")
+                    raise # 直接重新抛出 EntityNotFoundError
+                except Exception as e_inner:
+                    self._logger.error(f"Error converting '{chat_str}' to chat_id via session: {e_inner}", exc_info=True)
+                    raise EntityNotFoundError(f"解析 '{chat_str}' 时出错") from e_inner
+        else:
+             # 处理无效输入类型
+             raise TypeError(f"Invalid input type for str_to_chat_id: {type(chat)}")
 
 
     async def format_dialog_html(self, chat_id: int) -> str:
         """格式化对话的 HTML 链接和名称，包含 share_id"""
         try:
-            name = await self.translate_chat_id(int(chat_id))
+            # 确保 chat_id 是整数
+            chat_id_int = int(chat_id)
+            name = await self.translate_chat_id(chat_id_int)
             esc_name = html.escape(name)
             # 创建指向对话第一条消息的链接 (通常用于跳转到对话)
-            return f'<a href="https://t.me/c/{chat_id}/1">{esc_name}</a> (`{chat_id}`)'
-        except EntityNotFoundError: return f'未知对话 (`{chat_id}`)'
-        except ValueError: return f'无效对话 ID (`{chat_id}`)'
+            return f'<a href="https://t.me/c/{chat_id_int}/1">{esc_name}</a> (`{chat_id_int}`)'
+        except EntityNotFoundError:
+            # 如果无法翻译名称，仍然显示 ID
+            return f'未知对话 (`{chat_id}`)'
+        except (ValueError, TypeError):
+            # 如果 chat_id 格式无效
+            return f'无效对话 ID (`{chat_id}`)'
         except Exception as e:
+            # 其他获取名称时的错误
             self._logger.warning(f"Error formatting html for {chat_id}: {e}")
             return f'对话 `{chat_id}` (获取名称出错)'
 
@@ -608,6 +705,7 @@ class BackendBot:
     def _should_monitor(self, chat_id: int) -> bool:
         """判断是否应该监控此对话的消息 (基于配置和监控列表)"""
         try:
+            # 传入的可能是 peer_id，需要转为 share_id
             share_id = get_share_id(chat_id)
             if share_id in self.excluded_chats: return False
             # 如果配置了 monitor_all=True，或者该对话在当前的监控列表中，则监控
@@ -615,7 +713,7 @@ class BackendBot:
             # self._logger.debug(f"Should monitor {share_id}? monitor_all={self._cfg.monitor_all}, in_list={share_id in self.monitored_chats} -> {should}")
             return should
         except Exception as e:
-            self._logger.warning(f"Error determining monitor status for chat {chat_id}: {e}")
+            self._logger.warning(f"Error determining monitor status for input chat {chat_id}: {e}")
             return False
 
 
@@ -624,16 +722,21 @@ class BackendBot:
         """获取消息发送者的名称（用户或频道/群组标题）"""
         sender_name = ''
         try:
+            # 尝试获取发送者实体
             sender = await message.get_sender()
             if isinstance(sender, User):
+                # 如果是用户，格式化名称
                 sender_name = format_entity_name(sender)
-            elif hasattr(sender, 'title'): # Channels, Chats
+            elif hasattr(sender, 'title'): # 适用于频道、群组等
                 sender_name = sender.title
-            elif hasattr(sender, 'username'): # Fallback for users without full name?
+            elif hasattr(sender, 'username') and sender.username: # 最后的备选：用户名
                 sender_name = f"@{sender.username}"
+            # 可以添加更多对不同 Peer 类型的处理
         except Exception as e:
-            logger.debug(f"Could not get sender name for message {getattr(message, 'id', 'N/A')}: {e}")
-        return sender_name or '' # Ensure non-None return
+            # 记录获取发送者名称失败的调试信息
+            logger.debug(f"Could not get sender name for message {getattr(message, 'id', 'N/A')} in chat {getattr(message, 'chat_id', 'N/A')}: {e}")
+        # 确保返回字符串，即使获取失败也返回空字符串
+        return sender_name or ''
 
     def _register_hooks(self):
         """注册 Telethon 事件钩子，用于实时接收和处理消息"""
@@ -644,99 +747,120 @@ class BackendBot:
         # --- 处理新消息 ---
         @self.session.on(events.NewMessage())
         async def client_message_handler(event: events.NewMessage.Event):
-            # 基础检查：确保有 chat_id
-            if not hasattr(event, 'chat_id') or event.chat_id is None:
-                self._logger.debug("Ignoring event with no chat_id.")
+            # 基础检查：确保有 chat_id 和 message 对象
+            message = event.message
+            if not hasattr(event, 'chat_id') or event.chat_id is None or not message:
+                self._logger.debug("Ignoring event with no chat_id or message object.")
                 return
 
             try:
-                share_id = get_share_id(event.chat_id)
-                # --- 监控检查和反馈 ---
-                if not self._should_monitor(share_id):
-                    # self._logger.debug(f"Ignoring message from non-monitored chat {share_id}.")
+                # 使用 event.chat_id (通常是 peer_id) 来判断是否监控
+                if not self._should_monitor(event.chat_id):
+                    # self._logger.debug(f"Ignoring message from non-monitored chat {event.chat_id}.")
                     return # 不处理不监控的对话
+
+                # 使用 get_share_id 转换为 share_id 用于存储和 URL
+                share_id = get_share_id(event.chat_id)
 
                 # 如果是首次处理这个监控对话的消息（且未在日志中记录过），添加日志
                 if share_id not in _first_monitor_logged:
                      # 检查它是否确实在监控列表或 monitor_all=True
                      if share_id in self.monitored_chats or self._cfg.monitor_all:
-                         self._logger.info(f"[Monitoring] First message processed from monitored chat {share_id}.")
+                         self._logger.info(f"[Monitoring] First message processed from monitored chat {share_id} (Peer ID: {event.chat_id}).")
                          _first_monitor_logged.add(share_id)
-                     # else: 理论上不应发生，因为 _should_monitor 已检查
 
-                # --- 消息处理逻辑 (保持不变) ---
-                url = f'https://t.me/c/{share_id}/{event.id}'
-                sender = await self._get_sender_name(event.message)
-                post_time = event.message.date
+                # --- 消息处理逻辑 ---
+                url = f'https://t.me/c/{share_id}/{message.id}' # URL 使用 share_id
+                sender = await self._get_sender_name(message)
+                post_time = message.date
                 if not isinstance(post_time, datetime):
                     self._logger.warning(f"New message {url} has invalid date type {type(post_time)}, using current time.")
                     post_time = datetime.now()
 
                 msg_text, filename = '', None
-                if event.message.file and hasattr(event.message.file, 'name') and event.message.file.name:
-                    filename = event.message.file.name
-                    if event.message.text: msg_text = escape_content(event.message.text.strip())
+                if message.file and hasattr(message.file, 'name') and message.file.name:
+                    filename = message.file.name
+                    if message.text: msg_text = escape_content(message.text.strip())
                     self._logger.info(f'New file {url} from "{sender}" in chat {share_id}: "{filename}" Caption:"{brief_content(msg_text)}"')
-                elif event.message.text:
-                    msg_text = escape_content(event.message.text.strip())
+                elif message.text:
+                    msg_text = escape_content(message.text.strip())
+                    # 忽略纯空白消息
                     if not msg_text: self._logger.debug(f"Ignoring empty/whitespace message {url} in {share_id}."); return
                     self._logger.info(f'New msg {url} from "{sender}" in chat {share_id}: "{brief_content(msg_text)}"')
                 else:
+                    # 忽略既无文本也无有效文件名的消息
                     self._logger.debug(f"Ignoring message {url} with no text or file in {share_id}.")
                     return
 
+                # IndexMsg 使用 share_id
                 msg = IndexMsg(content=msg_text or "", url=url, chat_id=share_id, post_time=post_time, sender=sender or "", filename=filename)
+                # 更新最新消息缓存 (使用 share_id 作为 key)
                 if share_id not in self.newest_msg or msg.post_time >= self.newest_msg[share_id].post_time:
                     self.newest_msg[share_id] = msg
                     self._logger.debug(f"Updated newest cache for {share_id} to {url}")
                 try:
+                    # 添加文档到索引
                     self._indexer.add_document(msg)
                 except Exception as e:
                     self._logger.error(f"Error adding doc {url} to index: {e}", exc_info=True)
             except Exception as e:
+                # 顶层异常处理
                 chat_id_repr = getattr(event, 'chat_id', 'N/A')
                 self._logger.error(f"Error processing new message in chat {chat_id_repr}: {e}", exc_info=True)
 
         # --- 处理消息编辑 ---
         @self.session.on(events.MessageEdited())
         async def client_message_update_handler(event: events.MessageEdited.Event):
-            if not hasattr(event, 'chat_id') or event.chat_id is None: return
-            try:
-                share_id = get_share_id(event.chat_id)
-                if not self._should_monitor(share_id): return
+            message = event.message
+            if not hasattr(event, 'chat_id') or event.chat_id is None or not message: return
 
-                # 编辑处理逻辑 (保持不变)
-                # ...
-                url = f'https://t.me/c/{share_id}/{event.id}'
-                new_msg_text = escape_content(event.message.text.strip()) if event.message.text else ''
+            try:
+                # 检查是否监控此 chat_id
+                if not self._should_monitor(event.chat_id): return
+                # 获取 share_id
+                share_id = get_share_id(event.chat_id)
+
+                # 编辑处理逻辑
+                url = f'https://t.me/c/{share_id}/{message.id}' # URL 使用 share_id
+                new_msg_text = escape_content(message.text.strip()) if message.text else ''
                 self._logger.info(f'Msg {url} edited in chat {share_id}. Checking for update...')
 
                 try:
+                    # 使用 URL (唯一标识) 查询旧文档
                     old_fields = self._indexer.get_document_fields(url=url)
                     if old_fields:
+                        # 检查内容是否实际改变
                         if old_fields.get('content') == new_msg_text:
                             self._logger.debug(f"Edit event {url} has same content, skipping index update.")
                             return
-                        new_fields = old_fields.copy(); new_fields['content'] = new_msg_text
-                        new_fields.setdefault('chat_id', str(share_id))
+
+                        # 准备更新的字段
+                        new_fields = old_fields.copy()
+                        new_fields['content'] = new_msg_text
+                        # 确保关键字段存在且类型正确
+                        new_fields['chat_id'] = str(share_id) # 更新为当前 share_id (以防万一)
                         old_time = old_fields.get('post_time')
-                        new_fields['post_time'] = old_time if isinstance(old_time, datetime) else (event.message.date or datetime.now())
-                        if not isinstance(new_fields['post_time'], datetime): new_fields['post_time'] = datetime.now()
-                        new_fields.setdefault('sender', old_fields.get('sender', await self._get_sender_name(event.message) or ''))
+                        # 保留原始发帖时间，除非无法获取或类型错误
+                        new_fields['post_time'] = old_time if isinstance(old_time, datetime) else (message.date or datetime.now())
+                        if not isinstance(new_fields['post_time'], datetime): new_fields['post_time'] = datetime.now() # 再次确保是 datetime
+                        # 尝试保留原始发送者，否则重新获取
+                        new_fields.setdefault('sender', old_fields.get('sender', await self._get_sender_name(message) or ''))
+                        # 保留文件名等信息
                         new_fields.setdefault('filename', old_fields.get('filename', None))
-                        new_fields.setdefault('url', url)
+                        new_fields['url'] = url # 确保 URL 正确
                         new_fields['has_file'] = 1 if new_fields.get('filename') else 0
 
+                        # 执行替换操作
                         self._indexer.replace_document(url=url, new_fields=new_fields)
                         self._logger.info(f'Updated msg content in index for {url}')
 
+                        # 更新最新消息缓存（如果被编辑的是最新消息）
                         if share_id in self.newest_msg and self.newest_msg[share_id].url == url:
                              try:
-                                 # 使用 Whoosh 存储的字段类型重建 IndexMsg
-                                 # 注意： Whoosh 存 chat_id 为 str, post_time 为 datetime, has_file 为 int
+                                 # 使用更新后的字段重建 IndexMsg 用于缓存
                                  rebuilt_msg = IndexMsg(
                                      content=new_fields['content'], url=new_fields['url'],
-                                     chat_id=int(new_fields['chat_id']), # 转回 int
+                                     chat_id=share_id, # 直接使用 share_id
                                      post_time=new_fields['post_time'], # 已经是 datetime
                                      sender=new_fields['sender'], filename=new_fields['filename']
                                  )
@@ -745,73 +869,90 @@ class BackendBot:
                              except (ValueError, KeyError, TypeError) as cache_e:
                                  self._logger.error(f"Error reconstructing IndexMsg for cache update {url}: {cache_e}. Fields: {new_fields}")
                     else:
+                         # 如果旧文档不存在，视为新消息添加（仅当有内容时）
                          self._logger.warning(f'Edited msg {url} not found in index. Adding as new message.')
-                         sender = await self._get_sender_name(event.message)
-                         post_time = event.message.date or datetime.now()
-                         if not isinstance(post_time, datetime): post_time = datetime.now()
-                         filename = None # 假设编辑不改变文件信息
-                         if new_msg_text:
+                         if new_msg_text: # 确保编辑后有文本内容才添加
+                             sender = await self._get_sender_name(message)
+                             post_time = message.date or datetime.now()
+                             if not isinstance(post_time, datetime): post_time = datetime.now()
+                             filename = None # 编辑事件通常不带文件信息
+
+                             # 使用 share_id 创建新消息
                              msg = IndexMsg(content=new_msg_text, url=url, chat_id=share_id, post_time=post_time, sender=sender or "", filename=filename)
                              self._indexer.add_document(msg)
+                             # 更新最新消息缓存
                              if share_id not in self.newest_msg or msg.post_time >= self.newest_msg[share_id].post_time:
                                  self.newest_msg[share_id] = msg
                                  self._logger.debug(f"Added edited msg {url} as newest cache for {share_id}")
                          else:
                              self._logger.debug(f"Ignoring edited message {url} with empty content and not found in index.")
                 except Exception as e:
+                    # 处理更新/添加过程中的错误
                     self._logger.error(f'Error updating/adding edited msg {url} in index: {e}', exc_info=True)
             except Exception as e:
+                # 处理编辑事件顶层错误
                 chat_id_repr = getattr(event, 'chat_id', 'N/A')
                 self._logger.error(f"Error processing edited message in chat {chat_id_repr}: {e}", exc_info=True)
 
         # --- 处理消息删除 ---
         @self.session.on(events.MessageDeleted())
         async def client_message_delete_handler(event: events.MessageDeleted.Event):
+            # 检查 chat_id
             if not hasattr(event, 'chat_id') or event.chat_id is None:
                 self._logger.debug(f"Ignoring deletion event with no chat_id. Deleted IDs: {event.deleted_ids}")
                 return
-            try:
-                share_id = get_share_id(event.chat_id)
-                if not self._should_monitor(share_id):
-                    self._logger.debug(f"Ignoring deletion event from non-monitored chat {share_id}. Deleted IDs: {event.deleted_ids}")
-                    return
+            # 检查是否有删除的 ID
+            if not event.deleted_ids:
+                 self._logger.debug(f"Ignoring deletion event with empty deleted_ids list in chat {event.chat_id}.")
+                 return
 
-                # 删除处理逻辑 (保持不变)
-                # ...
+            try:
+                # 检查是否监控
+                if not self._should_monitor(event.chat_id):
+                    self._logger.debug(f"Ignoring deletion event from non-monitored chat {event.chat_id}. Deleted IDs: {event.deleted_ids}")
+                    return
+                # 获取 share_id
+                share_id = get_share_id(event.chat_id)
+
+                # 删除处理逻辑
                 deleted_count_in_batch = 0
+                # 使用 share_id 构建 URL
                 urls_to_delete = [f'https://t.me/c/{share_id}/{mid}' for mid in event.deleted_ids]
-                self._logger.info(f"Processing deletion of {len(urls_to_delete)} message(s) in chat {share_id}: {event.deleted_ids}")
+                self._logger.info(f"Processing deletion of {len(urls_to_delete)} message(s) in chat {share_id}: IDs {event.deleted_ids}")
 
                 try:
+                     # 使用批量写入/删除模式
                      with self._indexer.ix.writer() as writer:
                           for url in urls_to_delete:
+                               # 更新最新消息缓存
                                if share_id in self.newest_msg and self.newest_msg[share_id].url == url:
                                     del self.newest_msg[share_id]
                                     self._logger.info(f"Removed newest cache for {share_id} due to deletion of {url}.")
+                               # 执行删除
                                try:
+                                    # 使用 URL 删除
                                     count = writer.delete_by_term('url', url)
                                     if count > 0:
                                         deleted_count_in_batch += count
-                                        self._logger.info(f"Deleted msg {url} from index.")
-                                    else:
-                                        self._logger.debug(f"Message {url} requested for deletion not found in index.")
+                                        self._logger.debug(f"Deleted msg {url} from index (count: {count}).")
+                                    # else: 消息本就不在索引中，无需记录
                                except Exception as del_e:
-                                    self._logger.error(f"Error deleting doc {url} from index: {del_e}")
+                                    self._logger.error(f"Error deleting doc {url} from index within writer: {del_e}")
+                     # 提交批量删除
                      if deleted_count_in_batch > 0:
                          self._logger.info(f'Finished deleting {deleted_count_in_batch} msgs from index for chat {share_id}')
                      else:
-                         self._logger.info(f"No matching messages found in index to delete for chat {share_id} batch.")
+                         self._logger.info(f"No matching messages found in index to delete for chat {share_id} batch (URLs: {urls_to_delete}).")
                 except writing.LockError:
+                    # 处理索引锁定错误
                     self._logger.error(f"Index locked. Could not process deletions batch for {share_id}: {urls_to_delete}")
                 except Exception as e:
+                    # 处理其他批量删除错误
                     self._logger.error(f"Error processing deletions batch for {share_id}: {e}", exc_info=True)
             except Exception as e:
+                # 处理删除事件顶层错误
                 chat_id_repr = getattr(event, 'chat_id', 'N/A')
                 self._logger.error(f"Error processing deleted event in chat {chat_id_repr}: {e}", exc_info=True)
 
+        # 标记事件处理器注册完成（确保只在方法末尾执行一次）
         self._logger.info("Telethon event handlers registered.")
-
-                self._logger.error(f"Error processing deleted event in chat {chat_id_repr}: {e}", exc_info=True)
-
-        self._logger.info("Telethon event handlers registered.")
-
