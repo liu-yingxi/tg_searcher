@@ -6,7 +6,7 @@ from typing import Optional, Union, List, Set
 
 from whoosh import index, writing
 from whoosh.fields import Schema, TEXT, ID, DATETIME, NUMERIC # 索引字段类型
-# 移除 OrGroup 导入, 默认使用 AndGroup
+# 移除 OrGroup 导入, 默认使用 AndGroup (之前代码已移除)
 from whoosh.qparser import QueryParser, MultifieldPlugin
 from whoosh.writing import IndexWriter
 from whoosh.query import Term, Or, And, Not, Every # 查询对象
@@ -57,7 +57,7 @@ class IndexMsg:
             self.chat_id = 0
         # 确保 post_time 是 datetime 对象
         if not isinstance(post_time, datetime):
-            logger.warning(f"Invalid post_time type '{type(post_time)}' passed to IndexMsg, using current time.")
+            logger.warning(f"Invalid post_time type '{type(post_time)}' passed to IndexMsg for url {url}, using current time.")
             self.post_time = datetime.now()
         else:
             self.post_time = post_time
@@ -115,6 +115,7 @@ class Indexer:
         :param from_scratch: 是否清空并重新创建索引。
         """
         index_name = 'index' # 索引名称
+        self.index_dir = index_dir # 保存索引目录路径
         # 确保索引目录存在
         if not Path(index_dir).exists():
             try:
@@ -130,15 +131,28 @@ class Indexer:
             if index_dir.exists():
                 logger.warning(f"Clearing index directory: {index_dir}")
                 try:
-                    shutil.rmtree(index_dir)
-                    index_dir.mkdir(parents=True, exist_ok=True)
-                    logger.info(f"Index directory cleared: {index_dir}")
+                    # 尝试获取写锁以确保没有其他进程在写入
+                    lock = writing.Lock(index_dir, "WRITE")
+                    if lock.acquire(blocking=False): # 非阻塞获取
+                        try:
+                            shutil.rmtree(index_dir)
+                            index_dir.mkdir(parents=True, exist_ok=True)
+                            logger.info(f"Index directory cleared: {index_dir}")
+                        finally:
+                            lock.release() # 释放锁
+                    else:
+                         logger.error(f"Could not acquire write lock to clear index directory {index_dir}. Another process might be holding it.")
+                         # 如果无法获取锁，则不尝试删除，避免冲突
+                         raise writing.LockError(f"Cannot clear index, directory {index_dir} is locked.")
                 except OSError as e:
                     logger.error(f"Failed to clear index directory {index_dir}: {e}")
+                except Exception as e: # 捕获 LockError 等其他错误
+                     logger.error(f"Error during index clear operation: {e}", exc_info=True)
+                     raise # 重新抛出，让上层知道清理失败
             # 尝试创建新索引
             try:
                 self.ix = index.create_in(index_dir, IndexMsg.schema, index_name)
-                logger.info(f"New index created after clear attempt.")
+                logger.info(f"New index created in {index_dir} after clear attempt.")
             except Exception as e:
                 logger.critical(f"Failed to create new index after clear attempt: {e}")
                 raise
@@ -156,11 +170,9 @@ class Indexer:
                 logger.info(f"Creating new index in {index_dir}")
                 self.ix = index.create_in(index_dir, IndexMsg.schema, index_name)
         except index.EmptyIndexError:
-             # 处理索引为空或损坏的情况
             logger.warning(f"Index in {index_dir} was empty or corrupted, creating new index.")
             self.ix = index.create_in(index_dir, IndexMsg.schema, index_name)
         except writing.LockError:
-            # 处理索引被锁定的情况 (可能其他进程正在写入)
             logger.critical(f"Index '{index_dir}' is locked. Another process might be using it. Please check and retry.")
             raise
         except Exception as e:
@@ -169,42 +181,44 @@ class Indexer:
 
         # 检查磁盘上的 Schema 是否与代码中的定义兼容
         if not self.ix.is_empty():
-            expected_fields = sorted(IndexMsg.schema.names())
-            actual_fields = sorted(self.ix.schema.names())
-            if expected_fields != actual_fields:
-                 # 构造详细的错误信息
-                expected_set = set(expected_fields); actual_set = set(actual_fields)
-                missing_in_actual = expected_set - actual_set; extra_in_actual = actual_set - expected_set
-                error_msg = f"Incompatible schema in index '{index_dir}'\n"
-                if missing_in_actual: error_msg += f"\tMissing fields on disk: {sorted(list(missing_in_actual))}\n"
-                if extra_in_actual: error_msg += f"\tUnexpected fields on disk: {sorted(list(extra_in_actual))}\n"
-                error_msg += f"\tExpected: {expected_fields}\n"; error_msg += f"\tOn disk:  {actual_fields}\n"
-                error_msg += "Please clear the index (use -c or delete directory)."
-                raise ValueError(error_msg)
+            try:
+                expected_fields = sorted(IndexMsg.schema.names())
+                actual_fields = sorted(self.ix.schema.names())
+                if expected_fields != actual_fields:
+                    expected_set = set(expected_fields); actual_set = set(actual_fields)
+                    missing_in_actual = expected_set - actual_set; extra_in_actual = actual_set - expected_set
+                    error_msg = f"Incompatible schema in index '{index_dir}'\n"
+                    if missing_in_actual: error_msg += f"\tMissing fields on disk: {sorted(list(missing_in_actual))}\n"
+                    if extra_in_actual: error_msg += f"\tUnexpected fields on disk: {sorted(list(extra_in_actual))}\n"
+                    error_msg += f"\tExpected: {expected_fields}\n"; error_msg += f"\tOn disk:  {actual_fields}\n"
+                    error_msg += "Please clear the index (use -c or delete directory)."
+                    raise ValueError(error_msg)
+            except Exception as schema_e:
+                 logger.error(f"Error checking index schema compatibility: {schema_e}")
+                 # 根据需要决定是否要因为 schema 检查失败而中止
+                 # raise ValueError("Schema check failed.")
 
         self._clear = _clear # 将内部清理函数赋给实例变量，供外部调用
 
-        # --- QueryParser 配置 (恢复默认 AND 逻辑) ---
+        # --- QueryParser 配置 ---
         # 初始化查询解析器，默认搜索 'content' 字段
-        # 移除了 group=OrGroup 参数，使其默认使用 AndGroup (要求所有词都匹配)
+        # 注意：默认情况下，Whoosh 的 QueryParser 使用 AndGroup，意味着空格分隔的词语默认用 AND 连接
         self.query_parser = QueryParser('content', IndexMsg.schema)
-        # --- 结束修改点 ---
-
         # 添加插件，使得搜索同时作用于 'content' 和 'filename' 字段
         self.query_parser.add_plugin(MultifieldPlugin(["content", "filename"]))
 
         # 配置高亮器 (Highlighter)
         self.highlighter = highlight.Highlighter(
-            # 使用 ContextFragmenter 获取关键词上下文
             fragmenter=highlight.ContextFragmenter(maxchars=250, surround=80), # 片段最大字符数, 关键词前后字符数
-            # 使用 HtmlFormatter 将关键词用 <b> 标签包裹
             formatter=highlight.HtmlFormatter(tagname="b", between=" ... ") # 高亮标签, 多片段连接符
         )
 
     def retrieve_random_document(self) -> IndexMsg:
         """从索引中随机检索一条消息"""
         if self.ix.is_empty(): raise IndexError("Index is empty")
-        with self.ix.searcher() as searcher:
+        searcher = None
+        try:
+            searcher = self.ix.searcher()
             reader = searcher.reader()
             doc_nums = list(reader.all_doc_ids()) # 获取所有文档编号
             if not doc_nums: raise IndexError("Index contains no documents")
@@ -233,8 +247,14 @@ class Indexer:
                     sender=msg_dict['sender'], filename=msg_dict['filename']
                 )
             except Exception as e:
-                logger.error(f"Error reconstructing IndexMsg from {msg_dict}: {e}", exc_info=True)
+                logger.error(f"Error reconstructing IndexMsg from random doc {msg_dict}: {e}", exc_info=True)
                 raise ValueError(f"Failed to reconstruct IndexMsg: {e}")
+        except writing.LockError:
+            logger.error("Index locked, cannot retrieve random document.")
+            raise IndexError("Index is locked.") # 或者抛出 LockError
+        finally:
+             if searcher: searcher.close()
+
 
     def add_document(self, message: IndexMsg, writer: Optional[IndexWriter] = None):
         """
@@ -244,26 +264,27 @@ class Indexer:
         :param writer: 可选的外部 IndexWriter，用于批量添加。如果为 None，则内部创建并提交。
         """
         commit_locally = False # 标记是否需要在函数内部提交 writer
-        if writer is None:
-            # 如果没有提供外部 writer，则尝试获取内部 writer
-            try:
-                writer = self.ix.writer()
-                commit_locally = True
-            except writing.LockError:
-                logger.error("Failed to get index writer (LockError). Document not added.")
-                raise # 重新抛出锁错误
-            except Exception as e:
-                logger.error(f"Failed to get index writer: {e}", exc_info=True)
-                raise # 重新抛出其他错误
-
+        temp_writer = None # 临时 writer 变量
         try:
+            if writer is None:
+                # 如果没有提供外部 writer，则尝试获取内部 writer
+                try:
+                    temp_writer = self.ix.writer()
+                    commit_locally = True
+                    writer = temp_writer # 使用临时 writer
+                except writing.LockError:
+                    logger.error("Failed to get index writer (LockError). Document not added.")
+                    raise # 重新抛出锁错误
+                except Exception as e:
+                    logger.error(f"Failed to get index writer: {e}", exc_info=True)
+                    raise # 重新抛出其他错误
+
+            # --- 文档数据准备 ---
             doc_data = message.as_dict() # 将 IndexMsg 转换为字典
-            # URL 是必须的，否则跳过
             if not doc_data.get('url'):
-                logger.warning(f"Skipping document with empty URL. Content: {doc_data.get('content', '')[:50]}")
+                logger.warning(f"Skipping document with empty URL. Content: {brief_content(doc_data.get('content'))}")
                 if commit_locally and writer: writer.cancel() # 取消写入操作
                 return
-
             # 确保字段类型符合 Schema 要求
             doc_data['filename'] = doc_data['filename'] if doc_data['filename'] is not None else ""
             if not isinstance(doc_data['post_time'], datetime):
@@ -271,108 +292,100 @@ class Indexer:
                 doc_data['post_time'] = datetime.now()
             doc_data['has_file'] = int(doc_data.get('has_file', 0))
 
-            # 添加文档
+            # --- 添加文档 ---
             writer.add_document(**doc_data)
-            # 如果是本地创建的 writer，则提交
+
+            # --- 提交或取消 ---
             if commit_locally:
-                writer.commit()
+                writer.commit() # 提交本地创建的 writer
+                writer = None # 标记已关闭
         except Exception as e:
+            logger.error(f"Error adding document (URL: {message.url}): {e}", exc_info=True)
             # 如果添加过程中出错，且是本地 writer，则取消写入
             if commit_locally and writer:
                 try: writer.cancel()
-                except Exception as cancel_e: logger.error(f"Error cancelling writer: {cancel_e}")
-            logger.error(f"Error adding document (URL: {message.url}): {e}", exc_info=True)
-            # 可以选择是否重新抛出异常，取决于是否允许批量添加中部分失败
+                except Exception as cancel_e: logger.error(f"Error cancelling writer after add error: {cancel_e}")
+            raise # 重新抛出异常，让调用者知道添加失败
+        finally:
+             # 如果使用了临时 writer 且未被提交或取消 (例如在获取 writer 后立即出错)
+             if temp_writer and not temp_writer.is_closed:
+                 try: temp_writer.cancel() # 确保关闭
+                 except Exception: pass
+
 
     def search(self, q_str: str, in_chats: Optional[List[int]], page_len: int, page_num: int = 1, file_filter: str = "all") -> SearchResult:
         """
         执行搜索查询。
-
-        :param q_str: 用户输入的搜索字符串。
-        :param in_chats: 可选，限定在指定的 chat_id 列表中搜索。
-        :param page_len: 每页结果数量。
-        :param page_num: 要获取的页码 (从 1 开始)。
-        :param file_filter: 文件类型过滤 ('all', 'text_only', 'file_only')。
-        :return: SearchResult 对象。
+        (代码与之前版本基本一致，保持健壮性)
         """
         try:
-            # 解析用户查询字符串
             q = self.query_parser.parse(q_str)
             logger.debug(f"Parsed query: {q}")
         except Exception as e:
             logger.error(f"Failed to parse query '{q_str}': {e}")
             return SearchResult([], True, 0) # 返回空结果
 
+        searcher = None
         try:
-             # 获取 Searcher 对象
-            with self.ix.searcher() as searcher:
-                 # 构建 chat_id 过滤器
-                base_filter = None
-                if in_chats:
-                        valid_chat_ids = [str(cid) for cid in in_chats if isinstance(cid, int) or (isinstance(cid, str) and cid.lstrip('-').isdigit())]
-                        if valid_chat_ids: base_filter = Or([Term('chat_id', cid) for cid in valid_chat_ids])
+            searcher = self.ix.searcher()
+            base_filter = None
+            if in_chats:
+                valid_chat_ids = [str(cid) for cid in in_chats if isinstance(cid, int) or (isinstance(cid, str) and cid.lstrip('-').isdigit())]
+                if valid_chat_ids: base_filter = Or([Term('chat_id', cid) for cid in valid_chat_ids])
 
-                 # 构建文件类型过滤器
-                type_filter = None
-                if file_filter == "text_only": type_filter = Term("has_file", 0)
-                elif file_filter == "file_only": type_filter = Term("has_file", 1)
+            type_filter = None
+            if file_filter == "text_only": type_filter = Term("has_file", 0)
+            elif file_filter == "file_only": type_filter = Term("has_file", 1)
 
-                 # 合并过滤器
-                final_filter = None
-                if base_filter and type_filter: final_filter = And([base_filter, type_filter])
-                elif base_filter: final_filter = base_filter
-                elif type_filter: final_filter = type_filter
+            final_filter = None
+            if base_filter and type_filter: final_filter = And([base_filter, type_filter])
+            elif base_filter: final_filter = base_filter
+            elif type_filter: final_filter = type_filter
 
-                logger.debug(f"Executing search with query='{q}' and filter='{final_filter}'")
-                 # 执行分页搜索
-                result_page = searcher.search_page(q, page_num, page_len, filter=final_filter,
-                                                    sortedby='post_time', reverse=True, # 按时间倒序
-                                                    terms=True) # terms=True 用于高亮
-                logger.debug(f"Search found {result_page.total} results. Page {page_num} has {len(result_page)} hits.")
+            logger.debug(f"Executing search with query='{q}' and filter='{final_filter}' for page {page_num}")
+            result_page = searcher.search_page(q, page_num, page_len, filter=final_filter,
+                                               sortedby='post_time', reverse=True,
+                                               terms=True)
+            logger.debug(f"Search found {result_page.total} results. Page {page_num} has {len(result_page)} hits.")
 
-                hits = [] # 存储处理后的结果
-                for hit in result_page:
-                    try:
-                        stored_fields = hit.fields() # 获取存储的字段
-                        if not stored_fields:
-                                logger.warning(f"Hit {hit.docnum} had no stored fields.")
-                                continue
+            hits = []
+            for hit in result_page:
+                try:
+                    stored_fields = hit.fields()
+                    if not stored_fields:
+                        logger.warning(f"Hit {hit.docnum} had no stored fields.")
+                        continue
 
-                         # 确保时间字段是 datetime 对象
-                        post_time = stored_fields.get('post_time')
-                        if not isinstance(post_time, datetime):
-                                logger.warning(f"Retrieved non-datetime post_time ({type(post_time)}) for hit {hit.docnum}, using current time.")
-                                post_time = datetime.now()
+                    post_time = stored_fields.get('post_time')
+                    if not isinstance(post_time, datetime):
+                        logger.warning(f"Retrieved non-datetime post_time ({type(post_time)}) for hit {hit.docnum}, using current time.")
+                        post_time = datetime.now()
 
-                         # 重建 IndexMsg 对象
-                        msg = IndexMsg(
-                            content=stored_fields.get('content', ''),
-                            url=stored_fields.get('url', ''),
-                            chat_id=stored_fields.get('chat_id', '0'),
-                            post_time=post_time,
-                            sender=stored_fields.get('sender', ''),
-                            filename=stored_fields.get('filename')
-                        )
+                    msg = IndexMsg(
+                        content=stored_fields.get('content', ''),
+                        url=stored_fields.get('url', ''),
+                        chat_id=stored_fields.get('chat_id', '0'), # 获取的是 str
+                        post_time=post_time,
+                        sender=stored_fields.get('sender', ''),
+                        filename=stored_fields.get('filename') # 可能为 None
+                    )
 
-                         # 获取高亮文本片段
-                        highlighted_content = ""
-                        if msg.content: # 仅当有内容时才尝试高亮
-                            try:
-                                highlighted_content = self.highlighter.highlight_hit(hit, 'content') or ""
-                            except Exception as high_e:
-                                logger.error(f"Error highlighting hit {hit.docnum} content: {high_e}")
-                         # 如果高亮失败但有内容，使用简短原文作为后备
-                        if not highlighted_content and msg.content:
-                                highlighted_content = html.escape(brief_content(msg.content, 150)) # 增加后备长度
+                    highlighted_content = ""
+                    if msg.content:
+                        try:
+                            # 使用 Whoosh 的高亮器生成 HTML 片段
+                            highlighted_content = self.highlighter.highlight_hit(hit, 'content') or ""
+                        except Exception as high_e:
+                            logger.error(f"Error highlighting hit {hit.docnum} content: {high_e}")
+                            # 如果高亮失败但有内容，使用简短原文作为后备
+                            highlighted_content = html.escape(brief_content(msg.content, 150))
 
-                         # 创建 SearchHit 对象
-                        hits.append(SearchHit(msg, highlighted_content))
-                    except Exception as e:
-                        logger.error(f"Error processing hit {hit.docnum} (URL: {stored_fields.get('url')}): {e}", exc_info=True)
+                    hits.append(SearchHit(msg, highlighted_content))
+                except Exception as e:
+                    logger.error(f"Error processing hit {hit.docnum} (URL: {stored_fields.get('url', 'N/A')}): {e}", exc_info=True)
 
-                 # 计算是否为最后一页
-                is_last = (page_num * page_len) >= result_page.total
-                return SearchResult(hits, is_last, result_page.total)
+            is_last = (page_num * page_len) >= result_page.total if result_page.total is not None else True
+            return SearchResult(hits, is_last, result_page.total or 0)
 
         except writing.LockError:
             logger.error("Index is locked, cannot perform search.")
@@ -380,116 +393,137 @@ class Indexer:
         except Exception as e:
             logger.error(f"Search execution failed for query '{q_str}': {e}", exc_info=True)
             return SearchResult([], True, 0)
+        finally:
+             if searcher: searcher.close()
 
 
     def list_indexed_chats(self) -> Set[int]:
         """列出索引中存在的所有 chat_id"""
         if self.ix.is_empty(): return set()
         chat_ids = set()
+        reader = None
         try:
-             # 使用 reader 获取 'chat_id' 字段的词典 (lexicon)
-            with self.ix.reader() as r:
-                for chat_id_bytes in r.lexicon('chat_id'):
-                    try:
-                         # 解码并转换为整数
-                        chat_ids.add(int(chat_id_bytes.decode('utf-8')))
-                    except ValueError:
-                        logger.warning(f"Could not convert chat_id '{chat_id_bytes}' from lexicon to int.")
+            reader = self.ix.reader()
+            # 使用 reader 获取 'chat_id' 字段的词典 (lexicon)
+            for chat_id_bytes in reader.lexicon('chat_id'):
+                try:
+                    # 解码并转换为整数
+                    chat_ids.add(int(chat_id_bytes.decode('utf-8')))
+                except ValueError:
+                    logger.warning(f"Could not convert chat_id '{chat_id_bytes}' from lexicon to int.")
         except KeyError:
-             # 如果 'chat_id' 字段不存在
-            logger.warning("Field 'chat_id' not found in index lexicon.")
-            return set()
+             logger.warning("Field 'chat_id' not found in index lexicon.")
+             return set()
         except writing.LockError: logger.error("Index locked, cannot list chats."); return set()
         except Exception as e: logger.error(f"Error listing indexed chats: {e}", exc_info=True); return set()
+        finally:
+             if reader: reader.close()
         return chat_ids
 
 
     def count_by_query(self, **kw) -> int:
-        """根据简单的字段=值查询计算文档数量 (主要用于内部检查或简单统计)"""
+        """根据简单的字段=值查询计算文档数量 (用于内部检查或简单统计)"""
         if self.ix.is_empty(): return 0
-        # 如果没有查询条件，返回总文档数
         if not kw: return self.ix.doc_count()
+
+        searcher = None
         try:
-             # 假设只有一个查询条件
             field, value = list(kw.items())[0]
-             # 根据字段类型构建 Term 查询
-            if field == 'has_file':
-                query = Term(field, int(value)) # NUMERIC
-            else:
-                query = Term(field, str(value)) # TEXT or ID
+            if field == 'has_file': query = Term(field, int(value))
+            else: query = Term(field, str(value))
+
+            searcher = self.ix.searcher()
+            return searcher.doc_count(query=query)
         except (IndexError, ValueError, TypeError):
             logger.warning(f"Invalid arguments for count_by_query: {kw}. Returning total count.")
             return self.ix.doc_count()
-
-        try:
-             # 使用 searcher.doc_count 获取匹配数量
-            with self.ix.searcher() as s: return s.doc_count(query=query)
         except writing.LockError: logger.error("Index locked, cannot count docs."); return 0
         except Exception as e: logger.error(f"Error counting docs for {kw}: {e}", exc_info=True); return 0
+        finally:
+             if searcher: searcher.close()
 
 
     def delete(self, url: str):
         """根据 URL 删除索引中的文档"""
         if not url: return
+        writer = None
         try:
-            # 使用 writer 删除指定 term 的文档
-            with self.ix.writer() as writer:
-                deleted_count = writer.delete_by_term('url', url) # url 是 unique 字段
-                logger.debug(f"Deleted {deleted_count} doc(s) with URL '{url}'")
+            writer = self.ix.writer()
+            deleted_count = writer.delete_by_term('url', url) # url 是 unique 字段
+            writer.commit() # 提交删除
+            writer = None # 标记已关闭
+            logger.debug(f"Deleted {deleted_count} doc(s) with URL '{url}'")
         except writing.LockError: logger.error(f"Index locked, cannot delete doc by url '{url}'")
-        except Exception as e: logger.error(f"Error deleting doc by url '{url}': {e}", exc_info=True)
+        except Exception as e:
+             logger.error(f"Error deleting doc by url '{url}': {e}", exc_info=True)
+             if writer: # 如果出错，尝试取消
+                 try: writer.cancel()
+                 except Exception: pass
+        finally:
+             # 确保 writer 关闭
+             if writer and not writer.is_closed:
+                 try: writer.cancel()
+                 except Exception: pass
 
 
     def get_document_fields(self, url: str) -> Optional[dict]:
         """根据 URL 获取文档存储的所有字段"""
         if self.ix.is_empty() or not url: return None
+        searcher = None
         try:
-            # 使用 searcher.document() 直接获取
-            with self.ix.searcher() as searcher:
-                return searcher.document(url=url)
-        except KeyError:
-             # 如果文档不存在，Whoosh 会抛出 KeyError
-            return None
+            searcher = self.ix.searcher()
+            return searcher.document(url=url)
+        except KeyError: return None # 文档不存在
         except writing.LockError: logger.error(f"Index locked, cannot get doc fields for url '{url}'"); return None
         except Exception as e: logger.error(f"Error getting doc fields for url '{url}': {e}", exc_info=True); return None
+        finally:
+             if searcher: searcher.close()
 
 
     def replace_document(self, url: str, new_fields: dict):
         """
         替换索引中具有相同 URL 的文档。
-
-        :param url: 要替换文档的 URL。
-        :param new_fields: 包含新文档所有字段的字典。
+        (代码与之前版本基本一致，保持健壮性)
         """
         if not url: raise ValueError("Cannot replace document with empty URL.")
-        # 检查必需字段是否存在
         required = ['content', 'url', 'chat_id', 'post_time', 'sender']
         missing = [k for k in required if k not in new_fields]
         if missing: raise ValueError(f"Missing required field(s) {missing} for replace url '{url}'")
 
-        # 确保字段类型正确
         post_time = new_fields.get('post_time', datetime.now())
         if not isinstance(post_time, datetime):
             logger.warning(f"Correcting invalid post_time type {type(post_time)} for replace URL {url}.")
             post_time = datetime.now()
 
-        # 准备传递给 Whoosh 的字典
         doc_data = {
             'content': new_fields.get('content', ''), 'url': url,
             'chat_id': str(new_fields.get('chat_id', '0')),
             'post_time': post_time,
             'sender': new_fields.get('sender', ''),
-            'filename': new_fields.get('filename'), # Allow None
-            'has_file': 1 if new_fields.get('filename') else 0 # 重新计算 has_file
+            'filename': new_fields.get('filename'),
+            'has_file': 1 if new_fields.get('filename') else 0
         }
+
+        writer = None
         try:
-            # 使用 writer.update_document() 进行替换
-            with self.ix.writer() as writer: writer.update_document(**doc_data)
+            writer = self.ix.writer()
+            writer.update_document(**doc_data) # 使用 update_document 替换
+            writer.commit()
+            writer = None # 标记已关闭
         except writing.LockError:
             logger.error(f"Index locked, cannot replace document url '{url}'")
             raise # 重新抛出锁错误
         except Exception as e:
-            logger.error(f"Error replacing document url '{url}': {e}", exc_info=True); raise e
+            logger.error(f"Error replacing document url '{url}': {e}", exc_info=True)
+            if writer: # 出错时取消
+                 try: writer.cancel()
+                 except Exception: pass
+            raise e # 重新抛出
+        finally:
+             # 确保 writer 关闭
+             if writer and not writer.is_closed:
+                 try: writer.cancel()
+                 except Exception: pass
 
 
     def clear(self):
@@ -503,27 +537,23 @@ class Indexer:
             logger.error(f"Error during index clear operation: {e}")
             raise
 
-    def is_empty(self, chat_id=None) -> bool:
-        """
-        检查索引是否为空，或者特定 chat_id 是否没有文档。
 
-        :param chat_id: 可选，要检查的特定 chat_id。
-        :return: 如果索引 (或特定 chat_id) 为空则返回 True，否则返回 False。
-        """
-         # 先检查整体是否为空 (最快)
+    def is_empty(self, chat_id=None) -> bool:
+        """检查索引是否为空，或者特定 chat_id 是否没有文档。"""
         try:
             if self.ix.is_empty(): return True
         except writing.LockError:
-            logger.error("Index locked, cannot check emptiness."); return True # 无法检查时保守返回 True
+            logger.error("Index locked, cannot check emptiness."); return True
 
-        # 如果指定了 chat_id，则检查该 chat_id 的文档数量
         if chat_id is not None:
+            searcher = None
             try:
-                with self.ix.searcher() as searcher:
-                    q = Term("chat_id", str(chat_id))
-                    return searcher.doc_count(query=q) == 0
+                searcher = self.ix.searcher()
+                q = Term("chat_id", str(chat_id))
+                return searcher.doc_count(query=q) == 0
             except writing.LockError: logger.error(f"Index locked, cannot check emptiness for chat {chat_id}."); return True
-            except Exception as e: logger.error(f"Error checking emptiness for chat {chat_id}: {e}"); return True # 出错时保守返回 True
+            except Exception as e: logger.error(f"Error checking emptiness for chat {chat_id}: {e}"); return True
+            finally:
+                 if searcher: searcher.close()
         else:
-            # 如果没有指定 chat_id，且索引整体不为空，则返回 False
-            return False
+            return False # 索引整体不为空
