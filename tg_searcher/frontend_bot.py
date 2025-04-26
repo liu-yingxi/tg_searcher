@@ -280,7 +280,6 @@ class BotFrontend:
 - 回复带有 "☑️ 已选择" 的消息 + 搜索词，可仅搜索该对话。
 - 回复带有 "☑️ 已选择" 的消息 + 管理命令 (如 /download_chat, /clear)，可对该对话执行操作 (如果命令本身支持)。
 """
-    
     # 渲染搜索结果时，单条消息内容的最大显示字符数 (减少)
     MAX_TEXT_DISPLAY_LENGTH = 120
     # 高亮 HTML 片段的安全长度限制 (减少)
@@ -479,6 +478,7 @@ class BotFrontend:
             # 记录其他未知错误
             logger.warning(f"Unexpected error during usage tracking for user {user_id}: {e}", exc_info=True)
 
+
     async def _callback_handler(self, event: events.CallbackQuery.Event):
         """处理按钮回调查询 (CallbackQuery)"""
         try:
@@ -581,6 +581,8 @@ class BotFrontend:
 
                  # 根据回调的 action 和 value 确定新的页码和过滤器
                  new_page, new_filter = current_page, current_filter
+                 is_filter_action = (action == 'search_filter') # 标记是否是筛选操作
+
                  if action == 'search_page':
                       # 如果是翻页操作
                       try:
@@ -623,18 +625,35 @@ class BotFrontend:
 
                  # 调用后端执行搜索
                  start_time = time()
+                 response_text = "" # 初始化 response_text
+                 new_buttons = None # 初始化 buttons
+                 result = None # 初始化 result
                  try:
                      # 检查查询是否为空
                      if not current_query or current_query.isspace():
                          response_text = "关联的搜索关键词无效，请重新搜索。"
                          new_buttons = None # 不显示按钮
-                         result = None # 标记没有有效结果
                      else:
                          result = self.backend.search(current_query, chats, self._cfg.page_len, new_page, file_filter=new_filter)
                          search_time = time() - start_time
-                         # 渲染新的搜索结果文本和按钮
-                         response_text = await self._render_response_text(result, search_time)
-                         new_buttons = self._render_respond_buttons(result, new_page, current_filter=new_filter)
+
+                         # **修改点：处理筛选后无结果的情况**
+                         if result.total_results == 0 and is_filter_action:
+                             filter_map = {"text_only": "纯文本", "file_only": "仅文件"}
+                             filter_name = filter_map.get(new_filter, new_filter) # 获取筛选器中文名
+                             # 生成更具体的提示
+                             response_text = (
+                                 f"在 **{filter_name}** 筛选条件下，未找到与 "
+                                 f"“<code>{html.escape(brief_content(current_query, 50))}</code>” 相关的消息。"
+                             )
+                             # 仍然显示按钮，允许用户切换回其他筛选或翻页（如果之前有结果）
+                             # 注意：这里传递 result (即使为空) 和 new_page, new_filter
+                             # _render_respond_buttons 在 total_results 为 0 时会返回 None
+                             new_buttons = self._render_respond_buttons(result, new_page, current_filter=new_filter)
+                         else:
+                             # 正常渲染结果
+                             response_text = await self._render_response_text(result, search_time)
+                             new_buttons = self._render_respond_buttons(result, new_page, current_filter=new_filter)
 
                  except Exception as e:
                      self._logger.error(f"Backend search failed during callback processing: {e}", exc_info=True)
@@ -643,6 +662,11 @@ class BotFrontend:
 
                  # 尝试编辑原始消息以显示新结果
                  try:
+                     # 确保 response_text 不为空
+                     if not response_text:
+                         response_text = "处理时出现未知错误。" # Fallback message
+                         self._logger.error("Response text became empty unexpectedly during callback handling.")
+
                      await event.edit(response_text, parse_mode='html', buttons=new_buttons, link_preview=False)
                      await event.answer() # 向 Telegram 确认回调已处理
                  except rpcerrorlist.MessageNotModifiedError:
@@ -756,6 +780,7 @@ class BotFrontend:
              # 如果 total_results > 0 但 hits 为空，说明是无效页码
              if isinstance(result, SearchResult) and result.total_results > 0:
                  return f"没有找到相关的消息 (页码无效？总共 {result.total_results} 条)。"
+             # 如果 total_results 就是 0，则返回通用提示（除非被 callback_handler 覆盖）
              return "没有找到相关的消息。"
 
         # 使用列表存储消息片段，最后 join
@@ -866,7 +891,6 @@ class BotFrontend:
 
         return final_text.strip() # 移除末尾可能多余的空白
 
-
     def _strip_html(self, text: str) -> str:
         """简单的 HTML 标签剥离器，用于从高亮文本中获取纯文本"""
         # 使用正则表达式替换所有 <...> 标签为空字符串
@@ -875,9 +899,22 @@ class BotFrontend:
     def _render_respond_buttons(self, result: SearchResult, cur_page_num: int, current_filter: str = "all") -> Optional[List[List[Button]]]:
         """生成包含中文筛选和翻页按钮的列表 (中文)"""
         # 如果没有结果或结果无效，不显示按钮
-        if not isinstance(result, SearchResult) or result.total_results == 0:
+        # 注意：即使 total_results 为 0，如果是由 callback 触发的，也可能需要显示按钮以便切换回其他筛选器
+        # 因此，仅当 result 本身是 None 或不是 SearchResult 实例时才确定返回 None
+        if not isinstance(result, SearchResult):
             return None
+        # 如果 total_results 为 0，则不显示翻页按钮，但可能显示筛选按钮
+        if result.total_results == 0:
+            buttons = []
+            filter_buttons = []
+            filters = {"all": "全部", "text_only": "纯文本", "file_only": "仅文件"}
+            for f_key, f_text in filters.items():
+                button_text = f"【{f_text}】" if current_filter == f_key else f_text
+                filter_buttons.append(Button.inline(button_text, f'search_filter={f_key}'))
+            buttons.append(filter_buttons)
+            return buttons if buttons else None # 如果连筛选按钮都没有（理论上不应发生）则返回 None
 
+        # --- 正常处理有结果的情况 ---
         buttons = [] # 存储按钮行
 
         # --- 第一行：筛选按钮 (中文) ---
@@ -1086,6 +1123,7 @@ class BotFrontend:
                          await event.reply(f"🆘 执行搜索时发生内部错误: {type(e).__name__}")
                  else:
                      self._logger.debug("Ignoring message containing only mention or whitespace.")
+
 
     async def _handle_help_cmd(self, event: events.NewMessage.Event, args_str: str):
         """处理 /help 命令"""
