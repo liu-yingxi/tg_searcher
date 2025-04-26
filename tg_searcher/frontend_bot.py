@@ -991,12 +991,20 @@ class BotFrontend:
             ))
             # 如果管理员 ID 有效，为管理员单独设置命令
             if self._admin_id:
-                await self.bot(SetBotCommandsRequest(
-                    # 作用域为指定的管理员 Peer
-                    scope=BotCommandScopePeer(peer=self._admin_id),
-                    lang_code='',
-                    commands=admin_commands
-                ))
+                try:
+                    # 使用 get_input_entity 将整数 ID 转换为 InputPeer 对象
+                    admin_peer = await self.bot.get_input_entity(self._admin_id)
+                    await self.bot(SetBotCommandsRequest(
+                        scope=BotCommandScopePeer(peer=admin_peer), # <--- 使用转换后的 Peer 对象
+                        lang_code='',
+                        commands=admin_commands
+                    ))
+                except ValueError as e:
+                    # 如果 get_input_entity 失败 (例如管理员不存在或无法访问)
+                    logger.error(f"Failed to get input entity for admin_id {self._admin_id} when setting commands: {e}")
+                except Exception as e:
+                    # 捕获设置管理员命令时的其他潜在错误
+                    logger.error(f"An unexpected error occurred while setting admin commands for admin_id {self._admin_id}: {e}", exc_info=True)
             logger.info("Bot commands set successfully.")
         except Exception as e:
             logger.error(f"Failed to set bot commands: {e}", exc_info=True)
