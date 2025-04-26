@@ -278,9 +278,10 @@ class BotFrontend:
         self._admin_id: Optional[int] = None
         self.username: Optional[str] = None
         self.my_id: Optional[int] = None
-
-        self._TOTAL_USERS_KEY = f'{self.id}:total_users'
-        self._ACTIVE_USERS_KEY = f'{self.id}:active_users_15m'
+        
+        # 使用固定的、所有实例共享的键名
+        self._TOTAL_USERS_KEY = 'tgsearcher_shared:total_users'
+        self._ACTIVE_USERS_KEY = 'tgsearcher_shared:active_users_15m'
         self._ACTIVE_USER_TTL = 900
 
         self.download_arg_parser = ArgumentParser(prog="/download_chat", description="下载对话历史记录并索引", add_help=False, exit_on_error=False)
