@@ -2,7 +2,7 @@
 import html
 import asyncio # 用于异步操作，如 sleep
 from datetime import datetime
-from typing import Optional, List, Set, Dict, Any, Union
+from typing import Optional, List, Set, Dict, Any, Union, Tuple # 添加 Any, Tuple
 
 import telethon.errors.rpcerrorlist
 from telethon import events
@@ -13,19 +13,19 @@ from whoosh.query import Term # 用于构建查询
 from whoosh import writing, index as whoosh_index
 from whoosh.writing import IndexWriter, LockError # 写入和锁错误
 
-# 项目内导入
+# 项目内导入 - 使用包含文件索引的 Indexer
 from .indexer import Indexer, IndexMsg, SearchResult
 from .common import CommonBotConfig, escape_content, get_share_id, get_logger, format_entity_name, brief_content, \
     EntityNotFoundError
 from .session import ClientSession
 
+
 # 日志记录器
-# 注意：这里的 get_logger 返回的是已配置的 logger 实例
 logger = get_logger('backend_bot') # logger 在模块级别定义，所有实例共享
 
 
 class BackendBotConfig:
-    """存储 Backend Bot 配置的类"""
+    """存储 Backend Bot 配置的类 - 基于你提供的文件结构"""
     def __init__(self, **kw: Any):
         self.monitor_all: bool = kw.get('monitor_all', False) # 是否监控所有加入的对话
         # 原始排除列表，可能包含用户名或 ID
@@ -34,12 +34,17 @@ class BackendBotConfig:
         self.excluded_chats: Set[int] = set()
         # 初始化时尝试解析整数 ID
         for chat_id_or_name in self._raw_exclude_chats:
-            try: self.excluded_chats.add(get_share_id(int(chat_id_or_name)))
-            except (ValueError, TypeError): pass # 非整数留给 start() 解析
+            try:
+                # 确保输入是数字或可转换为数字的字符串
+                numeric_id = int(chat_id_or_name)
+                self.excluded_chats.add(get_share_id(numeric_id))
+            except (ValueError, TypeError):
+                 # 非数字留给 start() 解析 (如果是用户名)
+                 pass
 
 
 class BackendBot:
-    """处理索引、下载、后台监控的核心 Bot 类"""
+    """处理索引、下载、后台监控的核心 Bot 类 - 包含文件索引逻辑和修复"""
     def __init__(self, common_cfg: CommonBotConfig, cfg: BackendBotConfig,
                  session: ClientSession, clean_db: bool, backend_id: str):
         """初始化 Backend Bot"""
@@ -52,6 +57,7 @@ class BackendBot:
         # 初始化 Indexer
         if clean_db: self._logger.info(f'Index will be cleaned for backend {backend_id}')
         try:
+            # 使用包含文件字段的 Indexer
             self._indexer: Indexer = Indexer(common_cfg.index_dir / backend_id, clean_db)
         except ValueError as e: self._logger.critical(f"Indexer initialization failed: {e}"); raise
         except Exception as e: self._logger.critical(f"Unexpected error initializing indexer: {e}", exc_info=True); raise
@@ -67,8 +73,10 @@ class BackendBot:
             self.monitored_chats = set()
 
         # 存储最终的排除列表 (包括启动时解析的)
+        # 这里将配置中的整数ID解析结果与启动时可能解析的用户名结果合并
+        # 注意：_raw_exclude_chats 主要用于启动时解析用户名
         self.excluded_chats: Set[int] = cfg.excluded_chats
-        self._raw_exclude_chats: List[Union[int, str]] = cfg._raw_exclude_chats # 保留原始配置
+        self._raw_exclude_chats: List[Union[int, str]] = cfg._raw_exclude_chats # 保留原始配置，用于start解析
         # 缓存每个监控对话的最新消息 {chat_id: IndexMsg}
         self.newest_msg: Dict[int, IndexMsg] = dict()
         # 跟踪后台任务，例如下载历史记录
@@ -179,7 +187,7 @@ class BackendBot:
              # 记录后端搜索执行失败的错误
              self._logger.error(f"Backend search execution failed for {self.id}: {e}", exc_info=True)
              # 返回一个空的 SearchResult 对象，表示搜索失败
-             return SearchResult([], True, 0)
+             return SearchResult([], True, 0, page_num)
 
 
     def rand_msg(self) -> IndexMsg:
@@ -210,11 +218,11 @@ class BackendBot:
             return True
 
 
-    async def download_history(self, chat_id: int, min_id: int, max_id: int, call_back: Optional[callable] = None):
+    async def download_history(self, chat_id: Union[int, str], min_id: int, max_id: int, call_back: Optional[callable] = None):
         """
         下载指定对话的历史记录并添加到索引。
 
-        :param chat_id: 原始对话 ID (将被转换为 share_id)。
+        :param chat_id: 原始对话 ID 或用户名/链接。
         :param min_id: 要下载的最小消息 ID (不包括)。
         :param max_id: 要下载的最大消息 ID (0 表示无上限，会获取比 min_id 更新的所有消息)。
         :param call_back: 可选的回调函数，用于报告进度 (接收 cur_id, dl_count)。
@@ -222,22 +230,20 @@ class BackendBot:
         task_name = f"DownloadHistory-{chat_id}"
         self._logger.info(f"Starting task: {task_name} (min={min_id}, max={max_id})")
         share_id = -1 # 初始化为无效值
+        entity = None # 初始化实体
         try:
-            # 后端应该处理原始ID，内部转换为share_id用于存储和查询
-            # 但iter_messages可能需要原始ID或Peer对象，这里保持传入原始ID给session层
-            # get_share_id主要用于存储到IndexMsg和内部管理(monitored_chats, newest_msg)
-            entity = await self.session.get_entity(chat_id) # 先尝试获取实体
-            share_id = get_share_id(entity.id) # 使用获取到的实体ID生成share_id
-            # 如果 chat_id 本身就是 share_id (-100...), get_entity也能处理
-        except ValueError as e: # get_entity可能抛出ValueError
-             self._logger.error(f"Could not find entity for chat_id {chat_id}. Error: {e}")
+            # 尝试使用原始输入获取实体和 share_id
+            entity = await self.session.get_entity(chat_id)
+            share_id = get_share_id(entity.id)
+        except ValueError as e: # get_entity 可能抛出 ValueError
+             self._logger.error(f"Could not find entity for '{chat_id}'. Error: {e}")
              raise EntityNotFoundError(f"无法找到对话实体: {chat_id}") from e
         except Exception as e:
-            self._logger.error(f"Error resolving chat_id {chat_id} or getting share_id: {e}", exc_info=True)
-            raise EntityNotFoundError(f"解析对话 ID 时出错: {chat_id}") from e
+            self._logger.error(f"Error resolving chat '{chat_id}' or getting share_id: {e}", exc_info=True)
+            raise EntityNotFoundError(f"解析对话时出错: {chat_id}") from e
 
         task_name = f"DownloadHistory-{share_id}" # 更新任务名
-        self._logger.info(f'Downloading history for {share_id} (input_id={chat_id}, min={min_id}, max={max_id})')
+        self._logger.info(f'Downloading history for {share_id} (input="{chat_id}", min={min_id}, max={max_id})')
         # 检查对话是否在排除列表中
         if share_id in self.excluded_chats:
             self._logger.warning(f"Skipping download for excluded chat {share_id}.")
@@ -259,7 +265,7 @@ class BackendBot:
 
         try:
             # 使用 Telethon 异步迭代指定对话的消息历史
-            # 传递原始 chat_id 或获取到的 entity 给 iter_messages
+            # 传递获取到的 entity 给 iter_messages
             async for tg_message in self.session.iter_messages(entity=entity, min_id=min_id, max_id=max_id, limit=None, reverse=True): # reverse=True 确保从旧到新处理，便于确定 newest_msg
                 processed_count += 1
                 if not isinstance(tg_message, TgMessage): continue
@@ -273,6 +279,7 @@ class BackendBot:
                     post_time = datetime.now()
 
                 msg_text, filename = '', None
+                # 包含文件索引逻辑
                 if tg_message.file and hasattr(tg_message.file, 'name') and tg_message.file.name:
                     filename = tg_message.file.name
                     # 同时获取可能的文件标题/说明
@@ -283,7 +290,7 @@ class BackendBot:
                 # 只有当有文本内容或文件名时才索引
                 if msg_text or filename:
                     try:
-                        # IndexMsg 使用 share_id
+                        # IndexMsg 使用 share_id，并包含 filename
                         msg = IndexMsg(content=msg_text or "", url=url, chat_id=share_id, post_time=post_time, sender=sender or "", filename=filename)
                         msg_list.append(msg)
                         downloaded_count += 1
@@ -303,22 +310,22 @@ class BackendBot:
 
             # --- 处理下载错误 ---
         except telethon.errors.rpcerrorlist.ChannelPrivateError as e:
-            self._logger.error(f"Permission denied for chat {chat_id} ({share_id}). Is the backend account a member? Error: {e}")
+            self._logger.error(f"Permission denied for chat '{chat_id}' ({share_id}). Is the backend account a member? Error: {e}")
             self.monitored_chats.discard(share_id) # 移除无法访问的对话
             if is_newly_monitored: self._logger.info(f"[Monitoring] Removed newly added chat {share_id} due to access error.")
-            raise EntityNotFoundError(f"无法访问对话 {chat_id} ({share_id})，请确保后端账号是其成员。") from e
+            raise EntityNotFoundError(f"无法访问对话 '{chat_id}' ({share_id})，请确保后端账号是其成员。") from e
         except (telethon.errors.rpcerrorlist.ChatIdInvalidError, telethon.errors.rpcerrorlist.PeerIdInvalidError):
-            self._logger.error(f"Chat ID {chat_id} ({share_id}) invalid or peer not found.")
+            self._logger.error(f"Chat ID '{chat_id}' ({share_id}) invalid or peer not found.")
             self.monitored_chats.discard(share_id)
             if is_newly_monitored: self._logger.info(f"[Monitoring] Removed newly added chat {share_id} due to invalid ID.")
-            raise EntityNotFoundError(f"无效对话 ID 或无法找到 Peer: {chat_id} ({share_id})")
+            raise EntityNotFoundError(f"无效对话 ID 或无法找到 Peer: '{chat_id}' ({share_id})")
         except ValueError as e:
              # Telethon 的 get_entity 或 iter_messages 可能在找不到实体时抛出 ValueError
              if "Cannot find any entity corresponding to" in str(e) or "Could not find the input entity for" in str(e):
-                 self._logger.error(f"Cannot find entity for chat {chat_id} ({share_id}). Error: {e}")
+                 self._logger.error(f"Cannot find entity for chat '{chat_id}' ({share_id}). Error: {e}")
                  self.monitored_chats.discard(share_id)
                  if is_newly_monitored: self._logger.info(f"[Monitoring] Removed newly added chat {share_id} due to entity not found.")
-                 raise EntityNotFoundError(f"无法找到对话实体: {chat_id} ({share_id})") from e
+                 raise EntityNotFoundError(f"无法找到对话实体: '{chat_id}' ({share_id})") from e
              else:
                  # 其他类型的 ValueError
                  self._logger.error(f"ValueError iterating messages for {share_id}: {e}", exc_info=True)
@@ -576,16 +583,10 @@ class BackendBot:
 
                      # 尝试获取该对话的文档计数
                      try:
-                         # **修改点：使用 search 获取计数，而不是 doc_count**
-                         results = searcher.search(query, limit=0) # 执行搜索但不获取文档
-                         num = results.estimated_length() # 获取匹配总数 (Whoosh 2.7+)
-                         # 对于旧版 Whoosh，可能需要 results.total 或 len(results)
-                         # 如果 estimated_length() 不可用，可以尝试:
-                         # num = results.total if hasattr(results, 'total') else len(results)
+                         # **使用修复后的方法获取计数**
+                         num = self._indexer.count_by_query(query=query)
                          self._logger.debug(f"Count for chat {chat_id_str} (query={query}): {num}")
-                     # **修改点：移除不存在的 searching.SearchError**
-                     # except searching.SearchError as search_e: ... (移除此块)
-                     except Exception as e: # 捕获其他可能的错误，例如查询语法错误（虽然这里不太可能）
+                     except Exception as e: # 捕获其他可能的错误
                          self._logger.error(f"Unexpected error counting docs for chat {chat_id_str} (query={query}): {e}", exc_info=True)
                          if not detailed_status_error: detailed_status_error = f"部分对话计数失败 ({type(e).__name__}, e.g., chat {chat_id_str})"
 
@@ -778,7 +779,7 @@ class BackendBot:
                          self._logger.info(f"[Monitoring] First message processed from monitored chat {share_id} (Peer ID: {event.chat_id}).")
                          _first_monitor_logged.add(share_id)
 
-                # --- 消息处理逻辑 ---
+                # --- 消息处理逻辑 (包含文件) ---
                 url = f'https://t.me/c/{share_id}/{message.id}' # URL 使用 share_id
                 sender = await self._get_sender_name(message)
                 post_time = message.date
@@ -801,7 +802,7 @@ class BackendBot:
                     self._logger.debug(f"Ignoring message {url} with no text or file in {share_id}.")
                     return
 
-                # IndexMsg 使用 share_id
+                # IndexMsg 使用 share_id 并包含 filename
                 msg = IndexMsg(content=msg_text or "", url=url, chat_id=share_id, post_time=post_time, sender=sender or "", filename=filename)
                 # 更新最新消息缓存 (使用 share_id 作为 key)
                 if share_id not in self.newest_msg or msg.post_time >= self.newest_msg[share_id].post_time:
@@ -838,9 +839,9 @@ class BackendBot:
                     # 使用 URL (唯一标识) 查询旧文档
                     old_fields = self._indexer.get_document_fields(url=url)
                     if old_fields:
-                        # 检查内容是否实际改变
+                        # 检查内容是否实际改变 (忽略文件变化)
                         if old_fields.get('content') == new_msg_text:
-                            self._logger.debug(f"Edit event {url} has same content, skipping index update.")
+                            self._logger.debug(f"Edit event {url} has same text content, skipping index update.")
                             return
 
                         # 准备更新的字段
@@ -854,10 +855,10 @@ class BackendBot:
                         if not isinstance(new_fields['post_time'], datetime): new_fields['post_time'] = datetime.now() # 再次确保是 datetime
                         # 尝试保留原始发送者，否则重新获取
                         new_fields.setdefault('sender', old_fields.get('sender', await self._get_sender_name(message) or ''))
-                        # 保留文件名等信息
-                        new_fields.setdefault('filename', old_fields.get('filename', None))
+                        # 保留文件名等信息（重要：编辑事件不更新文件信息）
+                        new_fields['filename'] = old_fields.get('filename') # 保持旧的文件名
+                        new_fields['has_file'] = old_fields.get('has_file', 0) # 保持旧的文件状态
                         new_fields['url'] = url # 确保 URL 正确
-                        new_fields['has_file'] = 1 if new_fields.get('filename') else 0
 
                         # 执行替换操作
                         self._indexer.replace_document(url=url, new_fields=new_fields)
@@ -884,7 +885,8 @@ class BackendBot:
                              sender = await self._get_sender_name(message)
                              post_time = message.date or datetime.now()
                              if not isinstance(post_time, datetime): post_time = datetime.now()
-                             filename = None # 编辑事件通常不带文件信息
+                             # 编辑事件通常不带文件信息，设为 None
+                             filename = None
 
                              # 使用 share_id 创建新消息
                              msg = IndexMsg(content=new_msg_text, url=url, chat_id=share_id, post_time=post_time, sender=sender or "", filename=filename)
@@ -965,3 +967,53 @@ class BackendBot:
 
         # 标记事件处理器注册完成（确保只在方法末尾执行一次）
         self._logger.info("Telethon event handlers registered.")
+
+
+    async def add_chats_to_monitoring(self, chat_ids: List[int]) -> Tuple[Set[int], Dict[int, str]]:
+        """
+        将指定的对话 ID (share_id) 添加到实时监控列表。
+        注意：此方法仅在内存中添加，重启后若对话无索引消息，监控会丢失。
+
+        :param chat_ids: 需要添加到监控的 share_id 列表。
+        :return: 一个元组，包含:
+                 - 成功添加到监控列表的 share_id 集合。
+                 - 一个字典，键为添加失败的 share_id，值为失败原因字符串。
+        """
+        added_ok = set()
+        add_failed = {}
+
+        if not chat_ids:
+            return added_ok, add_failed
+
+        for chat_id in chat_ids:
+            if not isinstance(chat_id, int):
+                add_failed[chat_id] = "无效的 ID 类型" # 技术上 chat_id 传入是 int，但保持检查
+                continue
+
+            if chat_id in self.excluded_chats:
+                add_failed[chat_id] = "对话已被排除"
+                self._logger.info(f"[Monitoring] Ignoring request to monitor excluded chat {chat_id}")
+                continue
+
+            if chat_id in self.monitored_chats:
+                add_failed[chat_id] = "已在监控中"
+                self._logger.debug(f"[Monitoring] Chat {chat_id} is already monitored.")
+                continue
+
+            # 尝试添加到内存中的监控列表
+            self.monitored_chats.add(chat_id)
+            added_ok.add(chat_id)
+            self._logger.info(f"[Monitoring] Added chat {chat_id} to monitoring list via /monitor_chat.")
+            # 检查此 chat 是否存在于 newest_msg 缓存中，如果不存在，尝试加载
+            if chat_id not in self.newest_msg:
+                 self._logger.debug(f"Chat {chat_id} added to monitoring, checking for newest message in index...")
+                 try:
+                      result = self._indexer.search(q_str='*', in_chats=[chat_id], page_len=1, page_num=1, file_filter="all")
+                      if result.hits:
+                           self.newest_msg[chat_id] = result.hits[0].msg
+                           self._logger.debug(f"Loaded newest message for newly monitored chat {chat_id}: {result.hits[0].msg.url}")
+                 except Exception as e:
+                      self._logger.warning(f"Failed to load newest message for newly monitored chat {chat_id}: {e}")
+
+
+        return added_ok, add_failed
