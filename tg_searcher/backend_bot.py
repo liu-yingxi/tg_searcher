@@ -9,7 +9,8 @@ from telethon import events
 from telethon.tl.patched import Message as TgMessage
 from telethon.tl.types import User
 from whoosh.query import Term # 用于构建查询
-from whoosh import writing, searching # 导入 Whoosh 相关模块 (确保 searching 被导入)
+# 移除 searching 导入，因为它没有 SearchError
+from whoosh import writing, index as whoosh_index
 from whoosh.writing import IndexWriter, LockError # 写入和锁错误
 
 # 项目内导入
@@ -465,9 +466,7 @@ class BackendBot:
             self._logger.error(f"Error finding chat id for '{q}': {e}")
             return [] # 返回空列表表示查找失败
 
-    # *************************************************************************
-    # * FUNCTION MODIFIED BELOW (Issue 1: stat count fix - Refined logging)   *
-    # *************************************************************************
+
     async def get_index_status(self, length_limit: int = 4000) -> str:
         """获取后端索引状态的文本描述 (修正计数和错误处理逻辑, 增加日志)"""
         cur_len = 0
@@ -480,7 +479,7 @@ class BackendBot:
             self._logger.debug("Attempting to get total document count from index...")
             # 确保索引存在且可读
             if self._indexer and self._indexer.ix and not self._indexer.ix.is_empty():
-                # 尝试打开 searcher 来获取计数，因为 ix.doc_count() 有时可能不准确或引发问题
+                # 尝试打开 searcher 来获取计数
                 with self._indexer.ix.searcher() as s:
                     total_docs = s.doc_count_all() # 获取所有文档数
                 self._logger.debug(f"Successfully retrieved total document count: {total_docs}")
@@ -577,15 +576,18 @@ class BackendBot:
 
                      # 尝试获取该对话的文档计数
                      try:
-                         self._logger.debug(f"Counting documents for chat {chat_id_str} with query: {query}")
-                         num = searcher.doc_count(query=query)
-                         self._logger.debug(f"Count for chat {chat_id_str}: {num}")
-                     except searching.SearchError as search_e:
-                         self._logger.error(f"Whoosh SearchError counting docs for chat {chat_id_str} (query={query}): {search_e}", exc_info=True)
-                         if not detailed_status_error: detailed_status_error = f"部分对话计数失败 (SearchError, e.g., chat {chat_id_str})"
-                     except Exception as e:
+                         # **修改点：使用 search 获取计数，而不是 doc_count**
+                         results = searcher.search(query, limit=0) # 执行搜索但不获取文档
+                         num = results.estimated_length() # 获取匹配总数 (Whoosh 2.7+)
+                         # 对于旧版 Whoosh，可能需要 results.total 或 len(results)
+                         # 如果 estimated_length() 不可用，可以尝试:
+                         # num = results.total if hasattr(results, 'total') else len(results)
+                         self._logger.debug(f"Count for chat {chat_id_str} (query={query}): {num}")
+                     # **修改点：移除不存在的 searching.SearchError**
+                     # except searching.SearchError as search_e: ... (移除此块)
+                     except Exception as e: # 捕获其他可能的错误，例如查询语法错误（虽然这里不太可能）
                          self._logger.error(f"Unexpected error counting docs for chat {chat_id_str} (query={query}): {e}", exc_info=True)
-                         if not detailed_status_error: detailed_status_error = f"部分对话计数失败 (未知错误, e.g., chat {chat_id_str})"
+                         if not detailed_status_error: detailed_status_error = f"部分对话计数失败 ({type(e).__name__}, e.g., chat {chat_id_str})"
 
                      # 获取预先格式化好的 HTML 名称
                      chat_html = chat_html_map.get(chat_id, f"对话 `{chat_id}` (未知)")
@@ -616,7 +618,7 @@ class BackendBot:
                  if append_msg(["\n错误：索引被锁定，无法获取详细对话状态。\n"]):
                      sb.append(overflow_msg)
             except Exception as e:
-                 self._logger.error(f"Failed to get detailed status (outside chat loop): {e}", exc_info=True)
+                 self._logger.error(f"Failed to get detailed status (outside chat loop): {type(e).__name__}: {e}", exc_info=True)
                  if append_msg(["\n错误：无法获取详细状态。\n"]):
                      sb.append(overflow_msg)
             finally:
@@ -630,9 +632,7 @@ class BackendBot:
         # --- 结束详细信息获取 ---
 
         return ''.join(sb).strip() # 返回前移除末尾空白
-    # *************************************************************************
-    # * END OF MODIFIED FUNCTION                                              *
-    # *************************************************************************
+
 
     async def translate_chat_id(self, chat_id: int) -> str:
         """使用会话将 Chat ID (share_id) 翻译为名称"""
