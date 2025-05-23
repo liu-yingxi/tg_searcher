@@ -218,11 +218,11 @@ class BotFrontend:
 
 **使用 /chats 选择对话后:**
 - 回复带有 "☑️ 已选择" 的消息 + 搜索词，可仅搜索该对话。
-- 再次使用 /chats 或 /s 可取消选择。
+- 再次使用 /s 或 /chats 可取消选择。
 """
     # 帮助文本 - 管理员
     HELP_TEXT_ADMIN = """
-**通用命令:**
+**管理端可用命令:**
 /s `关键词` - 搜索消息 (或 `/search`, `/ss`；直接发送非命令文本也可)。
 /chats `[关键词]` - 列出/筛选已索引的对话，并提供选择按钮。
 /random - 从已索引的消息中随机返回一条。
@@ -245,7 +245,7 @@ class BotFrontend:
 - 回复带有 "☑️ 已选择" 的消息 + 搜索词，可仅搜索该对话。
 - 回复带有 "☑️ 已选择" 的消息 + 管理命令 (如 /download_chat, /monitor_chat, /clear)，可对该对话执行操作 (如果命令本身支持)。
 """
-    MAX_TEXT_DISPLAY_LENGTH = 120
+    MAX_TEXT_DISPLAY_LENGTH = 100 # Reduced from 120
     MAX_HIGHLIGHT_HTML_LENGTH = 300
     MAX_FILENAME_DISPLAY_LENGTH = 60
 
@@ -278,7 +278,7 @@ class BotFrontend:
         self._admin_id: Optional[int] = None
         self.username: Optional[str] = None
         self.my_id: Optional[int] = None
-        
+
         # 使用固定的、所有实例共享的键名
         self._TOTAL_USERS_KEY = 'tgsearcher_shared:total_users'
         self._ACTIVE_USERS_KEY = 'tgsearcher_shared:active_users_15m'
@@ -696,17 +696,52 @@ class BotFrontend:
     def _strip_html(self, text: str) -> str:
         return re.sub('<[^>]*>', '', text) if text else ''
 
+    def _generate_page_selection_row(self, current_page: int, total_pages: int, width: int = 1) -> List[Button]:
+        """Generates a row of page number buttons for pagination."""
+        if total_pages <= 1:
+            return []
+
+        page_buttons = []
+        pages_to_render = set()
+        pages_to_render.add(1)
+        pages_to_render.add(total_pages)
+        pages_to_render.add(current_page)
+
+        for i in range(1, width + 1): # Number of pages to show around current
+            if current_page - i > 1: # Avoid re-adding 1
+                pages_to_render.add(current_page - i)
+            if current_page + i < total_pages: # Avoid re-adding total_pages
+                pages_to_render.add(current_page + i)
+
+        sorted_pages = sorted(list(p for p in pages_to_render if 1 <= p <= total_pages))
+
+        last_page_rendered = 0
+        for p in sorted_pages:
+            if last_page_rendered > 0 and p > last_page_rendered + 1:
+                page_buttons.append(Button.inline("...", "noop"))
+
+            text = f"【{p}】" if p == current_page else str(p)
+            action = f"search_page={p}" if p != current_page else "noop"
+            page_buttons.append(Button.inline(text, action))
+            last_page_rendered = p
+
+        # Limit to a reasonable number of buttons for a single row (e.g., 7-8)
+        # This logic tries to be smart, but for very large total_pages and small width,
+        # it might still exceed typical row limits if not careful.
+        # A hard limit could be added if necessary. Max 8 buttons per row in Telegram.
+        return page_buttons[:8] # Hard cap at 8 buttons
+
     def _render_respond_buttons(self, result: SearchResult, cur_page_num: int, current_filter: str = "all") -> Optional[List[List[Button]]]:
         if not isinstance(result, SearchResult):
             return None
-
         buttons = []
-        filter_buttons = []
+        # Row 1: Filter buttons
         filters = {"all": "全部", "text_only": "纯文本", "file_only": "仅文件"}
+        filter_buttons_row = []
         for f_key, f_text in filters.items():
             button_text = f"【{f_text}】" if current_filter == f_key else f_text
-            filter_buttons.append(Button.inline(button_text, f'search_filter={f_key}'))
-        buttons.append(filter_buttons)
+            filter_buttons_row.append(Button.inline(button_text, f'search_filter={f_key}'))
+        buttons.append(filter_buttons_row)
 
         if result.total_results > 0: # 只有在有结果时才计算和显示翻页按钮
             try:
@@ -716,23 +751,29 @@ class BotFrontend:
                 self._logger.error(f"Error calculating total pages: {e}")
                 total_pages = 1
 
+            # Row 2: Page number selection
             if total_pages > 1:
-                page_buttons = []
+                page_selection_row = self._generate_page_selection_row(cur_page_num, total_pages, width=1)
+                if page_selection_row:
+                    buttons.append(page_selection_row)
+
+            # Row 3: Prev/Next navigation buttons
+            if total_pages > 1:
+                nav_buttons_row = []
                 if cur_page_num > 1:
-                    page_buttons.append(Button.inline('⬅️ 上一页', f'search_page={cur_page_num - 1}'))
-                page_buttons.append(Button.inline(f'{cur_page_num}/{total_pages}', 'noop'))
+                    nav_buttons_row.append(Button.inline('⬅️ 上一页', f'search_page={cur_page_num - 1}'))
+                # Optionally, keep the "X/Y" indicator if page selection row isn't enough
+                # nav_buttons_row.append(Button.inline(f'{cur_page_num}/{total_pages}', 'noop'))
                 if not result.is_last_page and cur_page_num < total_pages:
-                    page_buttons.append(Button.inline('下一页 ➡️', f'search_page={cur_page_num + 1}'))
-                if page_buttons:
-                    buttons.append(page_buttons)
+                    nav_buttons_row.append(Button.inline('下一页 ➡️', f'search_page={cur_page_num + 1}'))
+                if nav_buttons_row:
+                    buttons.append(nav_buttons_row)
 
         return buttons if buttons else None
 
     async def _register_commands(self):
         user_commands = [
-            BotCommand('s', '搜索消息 (支持关键词)'),
-            BotCommand('search', '搜索消息 (同 /s)'),
-            BotCommand('ss', '搜索消息 (同 /s)'),
+            BotCommand('s', '搜索消息 (别名: /search, /ss)'),
             BotCommand('chats', '列出/筛选已索引对话 (支持关键词)'),
             BotCommand('random', '随机返回一条消息'),
             BotCommand('help', '显示帮助信息'),
