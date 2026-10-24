@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/app",
+    "crates/telegram",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["TG Searcher Rust contributors"]
+rust-version = "1.88"
+
+[workspace.dependencies]
+tgsearcher-core = { path = "crates/core" }
+tgsearcher-app = { path = "crates/app" }
+tgsearcher-telegram = { path = "crates/telegram" }
+
+anyhow = "1"
+async-trait = "0.1"
+bincode = "1.3"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+jieba-rs = "0.11"
+opencv = { version = "0.101", default-features = false, features = ["imgcodecs", "imgproc", "features2d", "clang-runtime"] }
+parking_lot = "0.12"
+rand = "0.8"
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+# lz4 only: avoids pulling in a zstd C build (and its MSVC archiver quirk).
+tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+# Debug symbols for the OpenCV binding-generation build script can overflow the
+# MSVC /Z7 debug-record limit on Windows. Debuginfo is not needed for tests.
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

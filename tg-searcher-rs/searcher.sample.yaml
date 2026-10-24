@@ -1,0 +1,82 @@
+# TG Searcher sample configuration.
+#
+# Secrets are pulled from the environment; the file itself contains no
+# credentials. Export them before starting:
+#
+#   TG_API_ID=123456
+#   TG_API_HASH=...
+#   TG_PHONE=+15551234567
+#   TG_ADMIN_ID=123456789
+#   TG_BOT_TOKEN=123456:...
+#
+# Values written as ${VAR} are expanded at load time; a missing variable is a
+# startup error rather than an empty secret.
+
+common:
+  # Instance name; runtime data is stored under <runtime_dir>/<name>/
+  name: my_searcher
+  runtime_dir: ./data
+  api_id: ${TG_API_ID}
+  api_hash: ${TG_API_HASH}
+  # SOCKS5 is supported by the MTProto backend. HTTP(S) proxies are used by the
+  # bot frontend (Bot API) only.
+  # proxy: socks5://127.0.0.1:1080
+
+# Fuzzy search is on by default and only kicks in when exact search returns too
+# few results. The threshold is deliberately independent of the search code:
+#   0.0 = almost everything is a match
+#   1.0 = only a perfect match
+# It can also be overridden with TG_SEARCH_FUZZY_THRESHOLD or per query with
+# /s --threshold=0.45 ...
+search:
+  fuzzy:
+    enabled: true
+    mode: fallback       # fallback | always | off
+    threshold: 0.5
+    min_query_chars: 2
+    max_edit_distance: 2
+    ngram_size: 2
+    candidate_limit: 500
+    fallback_below_results: 1
+
+# OpenCV image search: /img2text and /img2img.
+image:
+  enabled: true
+  max_features: 500          # ORB keypoints per indexed image
+  match_ratio: 0.75          # Lowe ratio test
+  min_good_matches: 8
+  min_similarity: 0.12       # 0..1 ORB inlier ratio threshold
+  thumbnail_max_side: 320
+  jpeg_quality: 80
+  max_download_bytes: 20971520
+  index_history: true
+  max_images_per_chat: 0     # 0 = unlimited
+  phash_candidate_limit: 512
+  result_limit: 10
+  send_photo_limit: 3
+
+sessions:
+  - name: alice
+    phone: '${TG_PHONE}'
+
+backends:
+  - id: pub_index
+    use_session: alice
+    config:
+      monitor_all: false
+      # exclude_chats: [342843148, "@some_channel"]
+
+frontends:
+  - type: bot
+    id: public
+    use_backend: pub_index
+    config:
+      admin_id: ${TG_ADMIN_ID}
+      bot_token: "${TG_BOT_TOKEN}"
+      page_len: 10
+      # Use "127.0.0.1:6379" or a docker service name. Remove/disable for
+      # volatile in-memory pagination state.
+      redis: 127.0.0.1:6379
+      # no_redis: true
+      private_mode: false
+      # private_whitelist: [123456789]

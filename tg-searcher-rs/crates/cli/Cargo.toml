@@ -1,0 +1,23 @@
+[package]
+name = "tg-searcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Telegram message search bot with Chinese-aware fuzzy search and OpenCV image search"
+
+[[bin]]
+name = "tg-searcher"
+path = "src/main.rs"
+
+[dependencies]
+tgsearcher-core.workspace = true
+tgsearcher-app.workspace = true
+tgsearcher-telegram.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

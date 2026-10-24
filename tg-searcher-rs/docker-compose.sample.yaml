@@ -1,0 +1,21 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - ./redis:/data
+
+  tg-searcher:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - redis
+    env_file:
+      - .env
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+    # First login is interactive (phone code / 2FA). Run once with:
+    #   docker compose run --rm tg-searcher
+    stdin_open: true
+    tty: true
