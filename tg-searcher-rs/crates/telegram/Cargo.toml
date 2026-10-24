@@ -1,0 +1,24 @@
+[package]
+name = "tgsearcher-telegram"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tgsearcher-core.workspace = true
+tgsearcher-app.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+grammers-client = { version = "0.11", features = ["html", "proxy"] }
+grammers-mtsender = "0.11"
+grammers-session = { version = "0.11", features = ["sqlite-storage"] }
+grammers-tl-types = "0.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "json"] }
+serde.workspace = true
+teloxide = { version = "0.17", features = ["macros"] }
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "tgsearcher-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tgsearcher-core.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+redis.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bincode.workspace = true
